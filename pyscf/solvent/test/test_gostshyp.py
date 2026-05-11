@@ -114,7 +114,8 @@ class TestGOSTSHYP_VDW_OCC(unittest.TestCase):
 
 class TestFiniteDifference(unittest.TestCase):
     def test_gradient_finite_difference(self):
-        """Check gradient against central finite differences."""
+        """Full SCF+GOSTSHYP analytic gradient vs finite_diff."""
+        from pyscf.tools import finite_diff
         mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', cart=True,
                     verbose=0)
         gost = GOSTSHYP(mol, options={
@@ -123,34 +124,9 @@ class TestFiniteDifference(unittest.TestCase):
         mf.conv_tol = 1e-12
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
-        dm = mf.make_rdm1()
 
-        analytic = gost.grad(dm)
-
-        h = 1e-4
-        natm = mol.natm
-        fd_grad = np.zeros((natm, 3))
-        for iatm in range(natm):
-            for ix in range(3):
-                coords_p = mol.atom_coords().copy()
-                coords_m = mol.atom_coords().copy()
-                coords_p[iatm, ix] += h
-                coords_m[iatm, ix] -= h
-
-                mol_p = mol.copy()
-                mol_p.set_geom_(coords_p, unit='Bohr')
-                gost_p = GOSTSHYP(mol_p, options={
-                    'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
-                ep, _ = gost_p.kernel(dm)
-
-                mol_m = mol.copy()
-                mol_m.set_geom_(coords_m, unit='Bohr')
-                gost_m = GOSTSHYP(mol_m, options={
-                    'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
-                em, _ = gost_m.kernel(dm)
-
-                fd_grad[iatm, ix] = (ep - em) / (2 * h)
-
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -216,6 +192,14 @@ class TestSCFAttachment(unittest.TestCase):
         mf = scf.RHF(mol)
         mf_sol = mf.GOSTSHYP()
         self.assertTrue(hasattr(mf_sol, 'with_solvent'))
+
+    def test_gostshyp_rejects_post_scf(self):
+        from pyscf import mp
+        mol = make_hf_mol()
+        mf = scf.RHF(mol).run()
+        mp2 = mp.MP2(mf)
+        with self.assertRaises(TypeError):
+            gostshyp_for_scf(mp2)
 
 
 if __name__ == '__main__':

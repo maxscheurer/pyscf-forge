@@ -26,6 +26,9 @@ Supports two cavity types:
 References:
     J. Chem. Theory Comput. 2021, 17, 1, 583-597
     https://doi.org/10.1021/acs.jctc.0c01212
+
+    J. Chem. Theory Comput. 2025, 21, 2, 764-776
+    https://doi.org/10.1021/acs.jctc.4c01502
 """
 
 import numpy as np
@@ -716,6 +719,10 @@ class GOSTSHYP(lib.StreamObject):
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
     """Attach GOSTSHYP solvent model to SCF method."""
+    if not isinstance(mf, scf.hf.SCF):
+        raise TypeError(
+            'GOSTSHYP can only be used with SCF methods (RHF/UHF/RKS/UKS). '
+            f'Got {mf.__class__.__name__}')
     if solvent_obj is None:
         solvent_obj = GOSTSHYP(mf.mol)
     return _attach_solvent._for_scf(mf, solvent_obj, dm)
