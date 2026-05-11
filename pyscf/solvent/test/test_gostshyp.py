@@ -202,5 +202,73 @@ class TestSCFAttachment(unittest.TestCase):
             gostshyp_for_scf(mp2)
 
 
+class TestFiniteDifferenceOCC(unittest.TestCase):
+    def test_gradient_finite_difference_occ(self):
+        """Full SCF+GOSTSHYP analytic gradient vs finite_diff for vdw/occ cavity."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw/occ', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+
+class TestSphericalHarmonics(unittest.TestCase):
+    def test_gradient_spherical_basis(self):
+        """Gradient with spherical harmonic basis (exercises c2s transform)."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=False, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+
+class TestMultiAtom(unittest.TestCase):
+    def test_water_gradient(self):
+        """Gradient for a non-linear molecule (exercises np.add.at accumulation)."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+                    basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+
+class TestReset(unittest.TestCase):
+    def test_reset_rebuilds_surface(self):
+        """reset() clears cached properties and rebuilds for new geometry."""
+        mol1 = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(mol1, options={'cavity': 'vdw', 'pressure_mpa': 50_000})
+        mf = scf.RHF(mol1)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        e1 = mf.e_tot
+
+        mol2 = gto.M(atom='H 1 0 0; F 2.2 0 0', basis='sto-3g', cart=True, verbose=0)
+        mf.reset(mol2)
+        mf.kernel()
+        e2 = mf.e_tot
+        self.assertNotAlmostEqual(e1, e2, places=5)
+        self.assertTrue(mf.converged)
+
+
 if __name__ == '__main__':
     unittest.main()

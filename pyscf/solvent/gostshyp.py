@@ -118,6 +118,10 @@ def compute_surface_normals(atom_coords, grid, atom_idx):
     ref_coords = atom_coords[atom_idx]
     dr = ref_coords - grid
     dr_norm = np.linalg.norm(dr, axis=1, keepdims=True)
+    if np.any(dr_norm < 1e-14):
+        raise ValueError(
+            'Grid point coincides with its atom center; '
+            'surface tessellation is degenerate.')
     return dr / dr_norm
 
 
@@ -184,6 +188,9 @@ class GOSTSHYP(lib.StreamObject):
             rad_outer = rad + r_ext
             self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad_outer)
 
+            # Save outer surface_dict for gradient computation
+            self._outer_surface_dict = dict(self.surface_dict)
+
             norm_vec = self.surface_dict['norm_vec']
             grid_outer = self.surface_dict['grid_coords']
             grid_inner = grid_outer - r_ext * norm_vec
@@ -191,6 +198,7 @@ class GOSTSHYP(lib.StreamObject):
             R_outer = self.surface_dict['R_vdw']
             R_inner = R_outer - r_ext
             ratio_sq = (R_inner / R_outer) ** 2
+            self._occ_ratio_sq = ratio_sq
             area_occ = self.surface_dict['area'] * ratio_sq
 
             self.surface_dict['grid_coords_outer'] = grid_outer
@@ -199,6 +207,8 @@ class GOSTSHYP(lib.StreamObject):
             self.surface_dict['R_vdw'] = R_inner
         else:
             self.surface_dict = gen_surface(mol, ng=self.npoints, rad=rad)
+            self._outer_surface_dict = None
+            self._occ_ratio_sq = None
 
         # Build atom index
         atom_idx = np.zeros(len(self.surface_dict['area']), dtype=np.int32)
@@ -207,6 +217,9 @@ class GOSTSHYP(lib.StreamObject):
 
         self.grid_coords = self.surface_dict['grid_coords']
         self.areas = self.surface_dict['area']
+        if np.any(self.areas <= 0):
+            raise ValueError(
+                'Non-positive surface areas detected; cavity is degenerate.')
         self.atom_idx = atom_idx
         self.widths = np.pi * np.log(2) / self.areas
         self.n_gaussian = len(self.areas)
@@ -235,6 +248,14 @@ class GOSTSHYP(lib.StreamObject):
         return self
 
     def check_sanity(self):
+        if self.pressure_mpa <= 0:
+            raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
+        if self.scaling_factor <= 0:
+            raise ValueError(f'scaling_factor must be positive, got {self.scaling_factor}')
+        if self.cavity not in ('vdw', 'vdw/occ'):
+            raise ValueError(f"cavity must be 'vdw' or 'vdw/occ', got '{self.cavity}'")
+        if self.cavity == 'vdw/occ' and self.r_ext <= 0:
+            raise ValueError(f'r_ext must be positive for vdw/occ cavity, got {self.r_ext}')
         return self
 
     def kernel(self, dm):
@@ -261,6 +282,9 @@ class GOSTSHYP(lib.StreamObject):
     def _kernel_cached(self, dm):
         """Cached mode: uses precomputed gtilde and force_operators."""
         forces = np.einsum('bkg,bk->g', self.force_operators, dm, optimize=True)
+        if np.any(np.abs(forces) < 1e-15):
+            logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
+                        'SCF may not converge.')
         amplitudes = self.pressure_au * self.areas / forces
         self.amplitudes = amplitudes
         self.forces = forces
@@ -319,6 +343,9 @@ class GOSTSHYP(lib.StreamObject):
                 'bkgc,gc->bkg', overlap3_p,
                 self.surface_normals[shell_slice], optimize=True)
             forces = np.einsum('bk,bkg->g', dm, force_ops, optimize=True)
+            if np.any(np.abs(forces) < 1e-15):
+                logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
+                            'SCF may not converge.')
             amplitudes = self.pressure_au * self.areas[shell_slice] / forces
             self.amplitudes[shell_slice] = amplitudes
             self.forces[shell_slice] = forces
@@ -376,6 +403,11 @@ class GOSTSHYP(lib.StreamObject):
         -------
         grad : ndarray of shape (natm, 3)
         """
+        if self.forces is None:
+            raise RuntimeError(
+                'kernel() must be called before grad(). '
+                'Forces have not been computed.')
+
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
@@ -388,8 +420,12 @@ class GOSTSHYP(lib.StreamObject):
         """Cached gradient: uses precomputed gtilde and force_operators."""
         mol = self.mol
 
-        _, dareas = get_dF_dA(self.surface_dict)
-        dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+        if self._outer_surface_dict is not None:
+            _, dareas = get_dF_dA(self._outer_surface_dict)
+            dareas = dareas.transpose(1, 2, 0) * self._occ_ratio_sq
+        else:
+            _, dareas = get_dF_dA(self.surface_dict)
+            dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
 
         forces = self.forces
         gtilde_expval = self.gtilde_expval
@@ -523,8 +559,12 @@ class GOSTSHYP(lib.StreamObject):
         natm = mol.natm
         aoslice = mol.aoslice_by_atom()
 
-        _, dareas = get_dF_dA(self.surface_dict)
-        dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+        if self._outer_surface_dict is not None:
+            _, dareas = get_dF_dA(self._outer_surface_dict)
+            dareas = dareas.transpose(1, 2, 0) * self._occ_ratio_sq
+        else:
+            _, dareas = get_dF_dA(self.surface_dict)
+            dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
 
         forces = self.forces
         gtilde_expval = self.gtilde_expval
@@ -706,14 +746,14 @@ class GOSTSHYP(lib.StreamObject):
         """Reset for geometry optimization / scanner."""
         if mol is not None:
             self.mol = mol
-            self.__dict__.pop('gtilde', None)
-            self.__dict__.pop('force_operators', None)
-            self.build()
+        self.__dict__.pop('gtilde', None)
+        self.__dict__.pop('force_operators', None)
+        self.e = None
+        self.v = None
+        self.amplitudes = None
+        self.forces = None
+        self.build()
         return self
-
-    def nuc_grad_method(self):
-        from pyscf.solvent.grad.pcm import make_grad_object
-        return make_grad_object(self)
 
 
 @lib.with_doc(_attach_solvent._for_scf.__doc__)
