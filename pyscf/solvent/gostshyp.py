@@ -260,8 +260,10 @@ class GOSTSHYP(lib.StreamObject):
         forces = np.einsum('bkg,bk->g', self.force_operators, dm, optimize=True)
         amplitudes = self.pressure_au * self.areas / forces
         self.amplitudes = amplitudes
+        self.forces = forces
 
         gtilde_expval = np.einsum('bkg,bk->g', self.gtilde, dm, optimize=True)
+        self.gtilde_expval = gtilde_expval
 
         fock1 = np.einsum('g,bkg->bk', amplitudes, self.gtilde, optimize=True)
         fock2 = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
@@ -296,6 +298,8 @@ class GOSTSHYP(lib.StreamObject):
         energy = 0.0
         fock = np.zeros_like(dm)
         self.amplitudes = np.zeros(self.n_gaussian)
+        self.forces = np.zeros(self.n_gaussian)
+        self.gtilde_expval = np.zeros(self.n_gaussian)
 
         for shell_slice in chunks:
             off1 = int(shell_slice[0])
@@ -314,10 +318,12 @@ class GOSTSHYP(lib.StreamObject):
             forces = np.einsum('bk,bkg->g', dm, force_ops, optimize=True)
             amplitudes = self.pressure_au * self.areas[shell_slice] / forces
             self.amplitudes[shell_slice] = amplitudes
+            self.forces[shell_slice] = forces
 
             f1 = np.einsum('g,bkg->bk', amplitudes, overlap3_s, optimize=True)
 
             gtilde_expval = np.einsum('bk,bkg->g', dm, overlap3_s, optimize=True)
+            self.gtilde_expval[shell_slice] = gtilde_expval
             f2 = -self.pressure_au * self.areas[shell_slice] * gtilde_expval / (forces ** 2)
             f2 = np.einsum('g,bkg->bk', f2, force_ops, optimize=True)
 
@@ -367,15 +373,23 @@ class GOSTSHYP(lib.StreamObject):
         -------
         grad : ndarray of shape (natm, 3)
         """
-        mol = self.mol
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
+
+        if self.direct:
+            return self._grad_direct(dm)
+        else:
+            return self._grad_cached(dm)
+
+    def _grad_cached(self, dm):
+        """Cached gradient: uses precomputed gtilde and force_operators."""
+        mol = self.mol
 
         _, dareas = get_dF_dA(self.surface_dict)
         dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
 
-        forces = np.einsum('bkg,bk->g', self.force_operators, dm, optimize=True)
-        gtilde_expval = np.einsum('bkg,bk->g', self.gtilde, dm, optimize=True)
+        forces = self.forces
+        gtilde_expval = self.gtilde_expval
 
         # Term 1: area derivative
         dE1 = self.pressure_au * np.einsum(
@@ -494,6 +508,193 @@ class GOSTSHYP(lib.StreamObject):
                 'g,g,axg,g->ax', self.areas, gtilde_expval,
                 dFdR, rf2, optimize=True))
 
+        dE3 = force_operator_grad + width_grad_ftype
+
+        return dE1 + dE2 + dE3
+
+    def _grad_direct(self, dm):
+        """Integral-direct gradient: compute integrals on-the-fly in chunks."""
+        mol = self.mol
+        nao = mol.nao_nr()
+        nao_cart = mol.nao_nr(cart=True)
+        natm = mol.natm
+        aoslice = mol.aoslice_by_atom()
+
+        _, dareas = get_dF_dA(self.surface_dict)
+        dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+
+        forces = self.forces
+        gtilde_expval = self.gtilde_expval
+        amplitudes = self.amplitudes
+        wgrad_prefs = -np.pi * np.log(2) / (self.areas ** 2)
+
+        # Term 1: area derivative (no chunking needed)
+        dE1 = self.pressure_au * np.einsum(
+            'acg,g->ac', dareas, gtilde_expval / forces, optimize=True)
+
+        # Chunk size: peak memory is 18 * nao^2 * C * 8 bytes
+        max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
+        mem_per_grid = 18 * nao**2 * 8.0 / 1e6  # MB per grid point
+        chunk_size = max(1, int(max_memory / mem_per_grid))
+
+        if not mol.cart:
+            c2s = mol.cart2sph_coeff(normalized='sp')
+
+        shells = np.arange(self.n_gaussian)
+        chunks = [shells[i:i+chunk_size]
+                  for i in range(0, self.n_gaussian, chunk_size)]
+
+        gtilde_operator_grad = np.zeros((natm, 3))
+        dE_d_total = np.zeros((natm, 3))
+        force_operator_grad = np.zeros((natm, 3))
+        width_grad_ftype = np.zeros((natm, 3))
+
+        for chunk_idx in chunks:
+            C = len(chunk_idx)
+            g0 = int(chunk_idx[0])
+
+            # --- Build chunk-local fakemols ---
+            coords_c = self.grid_coords[chunk_idx]
+            widths_c = self.widths[chunk_idx]
+            areas_c = self.areas[chunk_idx]
+            normals_c = self.surface_normals[chunk_idx]
+            amplitudes_c = amplitudes[chunk_idx]
+            forces_c = forces[chunk_idx]
+            gtilde_expval_c = gtilde_expval[chunk_idx]
+            wgrad_prefs_c = wgrad_prefs[chunk_idx]
+            atom_idx_c = self.atom_idx[chunk_idx]
+            dareas_c = dareas[:, :, chunk_idx]
+
+            # --- Term 2: gtilde operator derivative ---
+            # s-type ip1 bra/ket
+            gmol_s = fakemol_for_gaussian(coords_c, widths_c)
+            supermol_s = mol + gmol_s
+            slices_s = (0, mol.nbas, 0, mol.nbas,
+                        mol.nbas, mol.nbas + gmol_s.nbas)
+            slices_sg = (mol.nbas, mol.nbas + gmol_s.nbas,
+                         0, mol.nbas, 0, mol.nbas)
+
+            dPQ = supermol_s.intor('int3c1e_ip1', shls_slice=slices_s)
+            dPQ = np.einsum('xijn,n->xij', dPQ, amplitudes_c, optimize=True)
+
+            dgtilde_braket = np.einsum('xij,ij->ix', dPQ, dm, optimize=True)
+            dgtilde_braket += np.einsum('xij,ji->ix', dPQ, dm, optimize=True)
+            del dPQ
+
+            gt_grad_chunk = np.asarray(
+                [np.sum(dgtilde_braket[p0:p1], axis=0)
+                 for p0, p1 in aoslice[:, 2:]])
+
+            # s-type ip1 Gaussian center
+            dG = supermol_s.intor('int3c1e_ip1', shls_slice=slices_sg)
+            dgtilde_gaussian = np.einsum(
+                'xnij,n,ij->nx', dG, amplitudes_c, dm, optimize=True)
+            del dG
+
+            np.add.at(gt_grad_chunk, atom_idx_c, dgtilde_gaussian)
+            gt_grad_chunk *= -1.0
+            gtilde_operator_grad += gt_grad_chunk
+            del dgtilde_braket, gt_grad_chunk, dgtilde_gaussian
+
+            # d-type width gradient
+            gmol_d = fakemol_for_gaussian(
+                coords_c, widths_c, l=2,
+                coeffs=wgrad_prefs_c * amplitudes_c)
+            supermol_d = mol + gmol_d
+            supermol_d.cart = True
+            slices_d = (0, mol.nbas, 0, mol.nbas,
+                        mol.nbas, mol.nbas + gmol_d.nbas)
+            overlap3d = supermol_d.intor(
+                'int3c1e', shls_slice=slices_d
+            ).reshape(nao_cart, nao_cart, C, 6)
+
+            if not mol.cart:
+                overlap3d = np.einsum(
+                    'ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s, optimize=True)
+
+            diagd = (overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3]
+                     + overlap3d[:, :, :, 5])
+            imd = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
+            dE_d_total -= np.einsum('acg,g->ac', dareas_c, imd, optimize=True)
+            del overlap3d, diagd, imd
+
+            # --- Term 3: force operator derivative ---
+            coeffs_fop_c = (
+                -2.0 * self.pressure_au * areas_c * gtilde_expval_c
+                * widths_c / (forces_c * forces_c))
+
+            # p-type ip1 bra/ket
+            gmol_f = fakemol_for_gaussian(
+                coords_c, widths_c, l=1, coeffs=coeffs_fop_c)
+            supermol_f = mol + gmol_f
+            slices_f = (0, mol.nbas, 0, mol.nbas,
+                        mol.nbas, mol.nbas + gmol_f.nbas)
+            dpq = supermol_f.intor(
+                'int3c1e_ip1', shls_slice=slices_f
+            ).reshape(3, nao, nao, C, 3)
+            dpq *= normals_c
+
+            dpq_ix = np.einsum('xijnp,ij->ix', dpq, dm, optimize=True)
+            dpq_ix += np.einsum('xijnp,ji->ix', dpq, dm, optimize=True)
+            del dpq
+
+            fop_grad_chunk = np.asarray(
+                [np.sum(dpq_ix[p0:p1], axis=0)
+                 for p0, p1 in aoslice[:, 2:]])
+
+            # p-type ip1 Gaussian center
+            slices_fg = (mol.nbas, mol.nbas + gmol_f.nbas,
+                         0, mol.nbas, 0, mol.nbas)
+            dG_f = supermol_f.intor(
+                'int3c1e_ip1', shls_slice=slices_fg
+            ).reshape(3, C, 3, nao, nao)
+
+            dG_f = np.einsum(
+                'xnpij,np->xnij', dG_f, normals_c, optimize=True)
+            dG_f = np.einsum('xnij,ij->nx', dG_f, dm, optimize=True)
+
+            np.add.at(fop_grad_chunk, atom_idx_c, dG_f)
+            fop_grad_chunk *= -1.0
+            force_operator_grad += fop_grad_chunk
+            del dpq_ix, fop_grad_chunk, dG_f
+
+            # f-type width gradient for force operators
+            coeffs_f2_c = -2.0 * widths_c * wgrad_prefs_c
+            gmol_ft = fakemol_for_gaussian(
+                coords_c, widths_c, l=3, coeffs=coeffs_f2_c)
+            supermol_ft = mol + gmol_ft
+            supermol_ft.cart = True
+            slices_ft = (0, mol.nbas, 0, mol.nbas,
+                         mol.nbas, mol.nbas + gmol_ft.nbas)
+            overlap3f = supermol_ft.intor(
+                'int3c1e', shls_slice=slices_ft
+            ).reshape(nao_cart, nao_cart, C, 10)
+
+            if not mol.cart:
+                overlap3f = np.einsum(
+                    'ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s, optimize=True)
+
+            xf = (overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3]
+                  + overlap3f[:, :, :, 5])
+            yf = (overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6]
+                  + overlap3f[:, :, :, 8])
+            zf = (overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7]
+                  + overlap3f[:, :, :, 9])
+            dx = np.einsum('ijg,ij->g', xf, dm, optimize=True)
+            dy = np.einsum('ijg,ij->g', yf, dm, optimize=True)
+            dz = np.einsum('ijg,ij->g', zf, dm, optimize=True)
+            dr = np.vstack((dx, dy, dz)).T
+            del overlap3f, xf, yf, zf
+
+            rf2_c = 1.0 / (forces_c * forces_c)
+            dr *= normals_c
+            dFdR = dareas_c * wgrad_prefs_c * forces_c / widths_c
+            dFdR += np.einsum('gc,axg->axg', dr, dareas_c, optimize=True)
+            width_grad_ftype -= self.pressure_au * np.einsum(
+                'g,g,axg,g->ax', areas_c, gtilde_expval_c,
+                dFdR, rf2_c, optimize=True)
+
+        dE2 = gtilde_operator_grad + dE_d_total
         dE3 = force_operator_grad + width_grad_ftype
 
         return dE1 + dE2 + dE3

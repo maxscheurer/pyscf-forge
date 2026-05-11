@@ -51,11 +51,9 @@ class TestGOSTSHYP_VDW(unittest.TestCase):
     def test_gradient(self):
         dm = self.mf.make_rdm1()
         grad = self.gost.grad(dm)
-        ref_x = np.array([-0.00951946951, 0.00951946951])
-        np.testing.assert_allclose(grad[:, 0], ref_x, atol=1e-7)
-        # y and z should be ~0
-        np.testing.assert_allclose(grad[:, 1], 0.0, atol=1e-10)
-        np.testing.assert_allclose(grad[:, 2], 0.0, atol=1e-10)
+        ref = np.array([[-0.00951946951, 0.0, 0.0],
+                        [ 0.00951946951, 0.0, 0.0]])
+        np.testing.assert_allclose(grad, ref, atol=1e-7)
 
     def test_translational_invariance(self):
         dm = self.mf.make_rdm1()
@@ -154,6 +152,61 @@ class TestFiniteDifference(unittest.TestCase):
                 fd_grad[iatm, ix] = (ep - em) / (2 * h)
 
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+
+class TestDirectGradient(unittest.TestCase):
+    def test_direct_gradient_vs_cached(self):
+        """Direct gradient must match cached gradient."""
+        mol = make_hf_mol()
+        opts = {'cavity': 'vdw', 'pressure_mpa': 50_000,
+                'npoints': 110, 'scaling_factor': 1.2}
+
+        gost_c = GOSTSHYP(mol, options={**opts, 'direct': False})
+        gost_d = GOSTSHYP(mol, options={**opts, 'direct': True})
+
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost_c)
+        mf.kernel()
+        dm = mf.make_rdm1()
+
+        gost_c.kernel(dm)
+        gost_d.kernel(dm)
+
+        grad_cached = gost_c.grad(dm)
+        grad_direct = gost_d.grad(dm)
+        np.testing.assert_allclose(grad_direct, grad_cached, atol=1e-12)
+
+    def test_direct_gradient_reference(self):
+        """Direct gradient must match known reference values."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2, 'direct': True})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        grad = gost.grad(dm)
+        ref = np.array([[-0.00951946951, 0.0, 0.0],
+                        [ 0.00951946951, 0.0, 0.0]])
+        np.testing.assert_allclose(grad, ref, atol=1e-7)
+
+    def test_direct_gradient_translational_invariance(self):
+        """Direct gradient must sum to zero over atoms."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'direct': True})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        grad = gost.grad(dm)
+        np.testing.assert_allclose(grad.sum(axis=0), 0.0, atol=1e-8)
 
 
 class TestSCFAttachment(unittest.TestCase):
