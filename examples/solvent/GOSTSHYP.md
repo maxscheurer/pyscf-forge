@@ -108,10 +108,13 @@ that compresses H-F under 50 GPa.
 
 ## References
 
-1. Lorenz, S.; Raich, F.; Eichkorn, K.; Apostolidis, C.; Kästner, J.
+1. Scheurer, M.; Dreuw, A.; Epifanovsky, E.; Head-Gordon, M.; Stauch, T.
+   Modeling Molecules under Pressure with Gaussian Potentials.
    *J. Chem. Theory Comput.* **2021**, 17, 583–597.
    [doi:10.1021/acs.jctc.0c01212](https://doi.org/10.1021/acs.jctc.0c01212)
 
-2. Lorenz, S.; Kästner, J.
-   *J. Chem. Theory Comput.* **2025**, 21, 764–776.
+2. Pausch, A.; Zeller, F.; Neudecker, T.
+   An Integral-Direct GOSTSHYP Algorithm for the Computation of High
+   Pressure Effects on Molecular and Electronic Structure.
+   *J. Chem. Theory Comput.* **2025**, 21, 747–761.
    [doi:10.1021/acs.jctc.4c01502](https://doi.org/10.1021/acs.jctc.4c01502)
