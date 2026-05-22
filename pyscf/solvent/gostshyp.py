@@ -144,7 +144,7 @@ class GOSTSHYP(lib.StreamObject):
     r_ext : float
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
-        If True, compute integrals on-the-fly without caching (default: False).
+        If True, compute integrals on-the-fly without caching (default: True).
     """
 
     def __init__(self, mol, options=None):
@@ -160,7 +160,7 @@ class GOSTSHYP(lib.StreamObject):
         self.scaling_factor = options.get('scaling_factor', 1.2)
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)  # Bohr (0.25 Ang)
-        self.direct = options.get('direct', False)
+        self.direct = options.get('direct', True)
 
         self.frozen = False
         self.equilibrium_solvation = False
@@ -281,7 +281,9 @@ class GOSTSHYP(lib.StreamObject):
 
     def _kernel_cached(self, dm):
         """Cached mode: uses precomputed gtilde and force_operators."""
-        forces = np.einsum('bkg,bk->g', self.force_operators, dm, optimize=True)
+        nao = self.mol.nao_nr()
+        dm_flat = dm.ravel(order='F')
+        forces = dm_flat @ self.force_operators.reshape(nao * nao, -1, order='F')
         if np.any(np.abs(forces) < 1e-15):
             logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
                         'SCF may not converge.')
@@ -289,12 +291,14 @@ class GOSTSHYP(lib.StreamObject):
         self.amplitudes = amplitudes
         self.forces = forces
 
-        gtilde_expval = np.einsum('bkg,bk->g', self.gtilde, dm, optimize=True)
+        gtilde_expval = dm_flat @ self.gtilde.reshape(nao * nao, -1, order='F')
         self.gtilde_expval = gtilde_expval
 
-        fock1 = np.einsum('g,bkg->bk', amplitudes, self.gtilde, optimize=True)
+        fock1 = (self.gtilde.reshape(nao * nao, -1, order='F') @ amplitudes
+                 ).reshape(nao, nao, order='F')
         fock2 = -self.pressure_au * self.areas * gtilde_expval / (forces ** 2)
-        fock2 = np.einsum('g,bkg->bk', fock2, self.force_operators, optimize=True)
+        fock2 = (self.force_operators.reshape(nao * nao, -1, order='F') @ fock2
+                 ).reshape(nao, nao, order='F')
 
         energy = np.vdot(fock1, dm)
         fock = fock1 + fock2
@@ -328,6 +332,9 @@ class GOSTSHYP(lib.StreamObject):
         self.forces = np.zeros(self.n_gaussian)
         self.gtilde_expval = np.zeros(self.n_gaussian)
 
+        dm_flat = dm.ravel(order='F')
+        nao2 = nao * nao
+
         for shell_slice in chunks:
             off1 = int(shell_slice[0])
             off2 = len(shell_slice)
@@ -339,10 +346,11 @@ class GOSTSHYP(lib.StreamObject):
                 'int3c1e', shls_slice=slices, aosym='s1'
             ).reshape(nao, nao, -1, 3)
 
-            force_ops = np.einsum(
-                'bkgc,gc->bkg', overlap3_p,
-                self.surface_normals[shell_slice], optimize=True)
-            forces = np.einsum('bk,bkg->g', dm, force_ops, optimize=True)
+            normals = self.surface_normals[shell_slice]
+            force_ops = np.einsum('bkgc,gc->bkg', overlap3_p, normals,
+                                  optimize=False)
+            force_ops_2d = force_ops.reshape(nao2, -1, order='F')
+            forces = dm_flat @ force_ops_2d
             if np.any(np.abs(forces) < 1e-15):
                 logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
                             'SCF may not converge.')
@@ -350,12 +358,13 @@ class GOSTSHYP(lib.StreamObject):
             self.amplitudes[shell_slice] = amplitudes
             self.forces[shell_slice] = forces
 
-            f1 = np.einsum('g,bkg->bk', amplitudes, overlap3_s, optimize=True)
+            overlap3_s_2d = overlap3_s.reshape(nao2, -1, order='F')
+            f1 = (overlap3_s_2d @ amplitudes).reshape(nao, nao, order='F')
 
-            gtilde_expval = np.einsum('bk,bkg->g', dm, overlap3_s, optimize=True)
+            gtilde_expval = dm_flat @ overlap3_s_2d
             self.gtilde_expval[shell_slice] = gtilde_expval
             f2 = -self.pressure_au * self.areas[shell_slice] * gtilde_expval / (forces ** 2)
-            f2 = np.einsum('g,bkg->bk', f2, force_ops, optimize=True)
+            f2 = (force_ops_2d @ f2).reshape(nao, nao, order='F')
 
             fock += f1 + f2
             energy += np.vdot(f1, dm)
@@ -387,8 +396,8 @@ class GOSTSHYP(lib.StreamObject):
         overlap3 = supermol.intor(
             'int3c1e', shls_slice=slices, aosym='s1'
         ).reshape(nao, nao, -1, 3)
-        force_ops = np.einsum(
-            'bkgc,gc->bkg', overlap3, self.surface_normals, optimize=True)
+        force_ops = np.einsum('bkgc,gc->bkg', overlap3, self.surface_normals,
+                              optimize=False)
         return force_ops
 
     def grad(self, dm):
