@@ -284,10 +284,14 @@ class GOSTSHYP(lib.StreamObject):
         nao = self.mol.nao_nr()
         dm_flat = dm.ravel(order='F')
         forces = dm_flat @ self.force_operators.reshape(nao * nao, -1, order='F')
-        if np.any(np.abs(forces) < 1e-15):
-            logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
-                        'SCF may not converge.')
         amplitudes = self.pressure_au * self.areas / forces
+        mask = amplitudes < 0
+        if np.any(mask):
+            n_neg = np.count_nonzero(mask)
+            logger.warn(self, 'GOSTSHYP: %d/%d (%.1f%%) negative amplitudes removed',
+                        n_neg, amplitudes.size, 100.0 * n_neg / amplitudes.size)
+            amplitudes[mask] = 0.0
+            forces[mask] = 1.0  # avoid division by zero in gradient
         self.amplitudes = amplitudes
         self.forces = forces
 
@@ -351,10 +355,14 @@ class GOSTSHYP(lib.StreamObject):
                                   optimize=False)
             force_ops_2d = force_ops.reshape(nao2, -1, order='F')
             forces = dm_flat @ force_ops_2d
-            if np.any(np.abs(forces) < 1e-15):
-                logger.warn(self, 'GOSTSHYP: near-zero force values detected; '
-                            'SCF may not converge.')
             amplitudes = self.pressure_au * self.areas[shell_slice] / forces
+            mask = amplitudes < 0
+            if np.any(mask):
+                n_neg = np.count_nonzero(mask)
+                logger.warn(self, 'GOSTSHYP: %d/%d (%.1f%%) negative amplitudes removed',
+                            n_neg, amplitudes.size, 100.0 * n_neg / amplitudes.size)
+                amplitudes[mask] = 0.0
+                forces[mask] = 1.0  # avoid division by zero in gradient
             self.amplitudes[shell_slice] = amplitudes
             self.forces[shell_slice] = forces
 

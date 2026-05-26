@@ -251,6 +251,37 @@ class TestMultiAtom(unittest.TestCase):
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
+class TestNegativeAmplitudeMasking(unittest.TestCase):
+    """Tight cavity triggers negative amplitudes; verify they are masked."""
+
+    def test_no_negative_amplitudes(self):
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 0.5})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        self.assertTrue(np.all(mf.with_solvent.amplitudes >= 0))
+
+    def test_gradient_finite_difference_tight_cavity(self):
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', cart=True,
+                    verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 26, 'scaling_factor': 0.5})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+
 class TestReset(unittest.TestCase):
     def test_reset_rebuilds_surface(self):
         """reset() clears cached properties and rebuilds for new geometry."""
