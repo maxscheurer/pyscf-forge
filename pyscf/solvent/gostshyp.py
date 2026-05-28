@@ -1177,7 +1177,10 @@ def make_hess_object(base_method):
     if isinstance(base_method, HessianBase):
         base_method = base_method.base
 
-    assert isinstance(base_method, _Solvation)
+    if not isinstance(base_method, _Solvation):
+        raise TypeError(
+            f'make_hess_object requires a GOSTSHYP-attached SCF method; '
+            f'got {base_method.__class__.__name__}')
     with_solvent = base_method.with_solvent
     if with_solvent.frozen:
         raise RuntimeError('Frozen solvent model is not available for energy hessian')
