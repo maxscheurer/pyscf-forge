@@ -773,7 +773,312 @@ class GOSTSHYP(lib.StreamObject):
         return self
 
 
-@lib.with_doc(_attach_solvent._for_scf.__doc__)
+def analytical_grad_vmat(gost, dm, atmlst=None):
+    """Derivative of GOSTSHYP Fock matrix w.r.t. nuclear coordinates at fixed density.
+
+    Computes dV/dR where V is the GOSTSHYP Fock matrix contribution,
+    holding the density matrix D fixed. This provides the CP-HF right-hand
+    side (make_h1) for the GOSTSHYP analytical Hessian.
+
+    Parameters
+    ----------
+    gost : GOSTSHYP
+        GOSTSHYP object with kernel() already called (needs amplitudes, forces, etc.)
+    dm : ndarray of shape (nao, nao)
+        Density matrix (held fixed during differentiation).
+    atmlst : list of int, optional
+        Atoms for which to compute derivatives. Default: all atoms.
+
+    Returns
+    -------
+    dV : ndarray of shape (len(atmlst), 3, nao, nao)
+        dV[ia, x] is the derivative of the Fock matrix w.r.t. coordinate x of atom atmlst[ia].
+    """
+    if gost.amplitudes is None:
+        raise RuntimeError(
+            'kernel() must be called before analytical_grad_vmat(). '
+            'Amplitudes have not been computed.')
+
+    if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
+        dm = dm[0] + dm[1]
+
+    mol = gost.mol
+    nao = mol.nao_nr()
+    nao_cart = mol.nao_nr(cart=True)
+    natm = mol.natm
+    aoslice = mol.aoslice_by_atom()
+
+    if atmlst is None:
+        atmlst = list(range(natm))
+    n_atmlst = len(atmlst)
+
+    # Build atom-to-output-index mapping
+    atom2idx = {}
+    for ia, atm in enumerate(atmlst):
+        atom2idx[atm] = ia
+
+    # Get area derivatives
+    if gost._outer_surface_dict is not None:
+        _, dareas = get_dF_dA(gost._outer_surface_dict)
+        dareas = dareas.transpose(1, 2, 0) * gost._occ_ratio_sq
+    else:
+        _, dareas = get_dF_dA(gost.surface_dict)
+        dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+
+    # Restrict dareas to atmlst
+    dareas_sel = dareas[atmlst]  # (n_atmlst, 3, ngrids)
+
+    forces = gost.forces
+    gtilde_expval = gost.gtilde_expval
+    amplitudes = gost.amplitudes
+    areas = gost.areas
+    widths = gost.widths
+    pressure = gost.pressure_au
+    wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
+
+    if not mol.cart:
+        c2s = mol.cart2sph_coeff(normalized='sp')
+
+    # Output array
+    dV = np.zeros((n_atmlst, 3, nao, nao))
+
+    # Memory management for chunking
+    mem_per_grid = 30 * nao**2 * 8.0 / 1e6  # MB per grid point (conservative)
+    max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
+    chunk_size = max(1, int(max_memory / mem_per_grid))
+
+    shells = np.arange(gost.n_gaussian)
+    chunks = [shells[i:i+chunk_size]
+              for i in range(0, gost.n_gaussian, chunk_size)]
+
+    for chunk_idx in chunks:
+        C = len(chunk_idx)
+
+        coords_c = gost.grid_coords[chunk_idx]
+        widths_c = widths[chunk_idx]
+        areas_c = areas[chunk_idx]
+        normals_c = gost.surface_normals[chunk_idx]
+        amplitudes_c = amplitudes[chunk_idx]
+        forces_c = forces[chunk_idx]
+        gtilde_expval_c = gtilde_expval[chunk_idx]
+        wgrad_prefs_c = wgrad_prefs[chunk_idx]
+        atom_idx_c = gost.atom_idx[chunk_idx]
+        dareas_c = dareas_sel[:, :, chunk_idx]  # (n_atmlst, 3, C)
+
+        # alpha_g = P * A_g / F_g, beta_g = -P * A_g * <g_g> / F_g^2
+        alpha_c = amplitudes_c
+        beta_c = -pressure * areas_c * gtilde_expval_c / (forces_c ** 2)
+
+        # ===== Build fakemols =====
+        gmol_s = fakemol_for_gaussian(coords_c, widths_c)
+        gmol_p = fakemol_for_gaussian(coords_c, widths_c, l=1,
+                                      coeffs=2.0 * widths_c)
+        supermol_s = mol + gmol_s
+        supermol_p = mol + gmol_p
+
+        slices_s = (0, mol.nbas, 0, mol.nbas,
+                    mol.nbas, mol.nbas + gmol_s.nbas)
+        slices_sg = (mol.nbas, mol.nbas + gmol_s.nbas,
+                     0, mol.nbas, 0, mol.nbas)
+        slices_p = (0, mol.nbas, 0, mol.nbas,
+                    mol.nbas, mol.nbas + gmol_p.nbas)
+        slices_pg = (mol.nbas, mol.nbas + gmol_p.nbas,
+                     0, mol.nbas, 0, mol.nbas)
+
+        # ===== Compute base integrals (for coefficient response) =====
+        # Gtilde_g matrices: (nao, nao, C)
+        overlap3_s = supermol_s.intor('int3c1e', shls_slice=slices_s)
+        # Fhat_g matrices: contract p-type with normals
+        overlap3_p_raw = supermol_p.intor(
+            'int3c1e', shls_slice=slices_p).reshape(nao, nao, C, 3)
+        fhat = np.einsum('ijgc,gc->ijg', overlap3_p_raw, normals_c, optimize=True)
+        del overlap3_p_raw
+
+        # ===== Integral derivatives =====
+        # s-type ip1 bra/ket and Gaussian center
+        dPQ_s = supermol_s.intor('int3c1e_ip1', shls_slice=slices_s)
+        dG_s = supermol_s.intor('int3c1e_ip1', shls_slice=slices_sg)
+
+        # p-type ip1 bra/ket and Gaussian center, contracted with normals
+        dPQ_p_raw = supermol_p.intor(
+            'int3c1e_ip1', shls_slice=slices_p).reshape(3, nao, nao, C, 3)
+        dPQ_p = np.einsum('xijgc,gc->xijg', dPQ_p_raw, normals_c, optimize=True)
+        del dPQ_p_raw
+
+        dG_p_raw = supermol_p.intor(
+            'int3c1e_ip1', shls_slice=slices_pg).reshape(3, C, 3, nao, nao)
+        dG_p = np.einsum('xgcij,gc->xgij', dG_p_raw, normals_c, optimize=True)
+        del dG_p_raw
+
+        # d-type integrals for Gtilde width correction
+        # d(Gtilde_g)/d(omega) = -diagd
+        gmol_d = fakemol_for_gaussian(coords_c, widths_c, l=2)
+        supermol_d = mol + gmol_d
+        supermol_d.cart = True
+        slices_d = (0, mol.nbas, 0, mol.nbas,
+                    mol.nbas, mol.nbas + gmol_d.nbas)
+        overlap3d = supermol_d.intor(
+            'int3c1e', shls_slice=slices_d).reshape(nao_cart, nao_cart, C, 6)
+        if not mol.cart:
+            overlap3d = np.einsum(
+                'ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s, optimize=True)
+        # diagd = <chi_i|r^2*exp(-omega*r^2)|chi_j>
+        diagd = overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3] + overlap3d[:, :, :, 5]
+        del overlap3d
+
+        # f-type integrals for Fhat width correction (exponent derivative)
+        # The exponent derivative of Fhat gives: -2*omega * f_contracted
+        # Use coeffs=-2*omega in fakemol so f_contracted includes that factor
+        gmol_ft = fakemol_for_gaussian(coords_c, widths_c, l=3,
+                                       coeffs=-2.0 * widths_c)
+        supermol_ft = mol + gmol_ft
+        supermol_ft.cart = True
+        slices_ft = (0, mol.nbas, 0, mol.nbas,
+                     mol.nbas, mol.nbas + gmol_ft.nbas)
+        overlap3f = supermol_ft.intor(
+            'int3c1e', shls_slice=slices_ft).reshape(nao_cart, nao_cart, C, 10)
+        if not mol.cart:
+            overlap3f = np.einsum(
+                'ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s, optimize=True)
+        # Laplacian traces: x->0,3,5; y->1,6,8; z->2,7,9
+        fx = overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3] + overlap3f[:, :, :, 5]
+        fy = overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6] + overlap3f[:, :, :, 8]
+        fz = overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7] + overlap3f[:, :, :, 9]
+        # Contract with normals: f_contracted[i,j,g] = sum_c n_c * f_trace_c[i,j,g]
+        f_contracted = (fx * normals_c[:, 0] + fy * normals_c[:, 1]
+                        + fz * normals_c[:, 2])
+        del overlap3f, fx, fy, fz
+
+        # ===== Direct integral derivative terms (alpha, beta held fixed) =====
+        # Bra/ket contributions (atom A owns basis functions p0:p1)
+        for ia, atm in enumerate(atmlst):
+            p0, p1 = aoslice[atm, 2], aoslice[atm, 3]
+            # Gtilde bra + ket
+            dV[ia, :, p0:p1, :] -= np.einsum(
+                'xijg,g->xij', dPQ_s[:, p0:p1, :, :], alpha_c, optimize=True)
+            dV[ia, :, :, p0:p1] -= np.einsum(
+                'xijg,g->xji', dPQ_s[:, p0:p1, :, :], alpha_c, optimize=True)
+            # Fhat bra + ket
+            dV[ia, :, p0:p1, :] -= np.einsum(
+                'xijg,g->xij', dPQ_p[:, p0:p1, :, :], beta_c, optimize=True)
+            dV[ia, :, :, p0:p1] -= np.einsum(
+                'xijg,g->xji', dPQ_p[:, p0:p1, :, :], beta_c, optimize=True)
+
+        # Gaussian center contributions
+        for ig in range(C):
+            atm = atom_idx_c[ig]
+            if atm in atom2idx:
+                ia = atom2idx[atm]
+                dV[ia, :, :, :] -= alpha_c[ig] * dG_s[:, ig, :, :]
+                dV[ia, :, :, :] -= beta_c[ig] * dG_p[:, ig, :, :]
+
+        # Width corrections via area derivatives
+        # Gtilde: d(Gtilde)/d(omega) = -diagd
+        #   contribution: alpha * d(omega)/dR * (-diagd) = -alpha * wgrad * dA * diagd
+        dV -= np.einsum('axg,g,ijg->axij', dareas_c,
+                        alpha_c * wgrad_prefs_c, diagd, optimize=True)
+        # Fhat: d(Fhat)/d(omega) = Fhat/omega + f_contracted
+        #   (f_contracted already contains -2*omega from coeffs)
+        #   contribution: beta * wgrad * dA * (Fhat/omega + f_contracted)
+        dV += np.einsum('axg,g,ijg->axij', dareas_c,
+                        beta_c * wgrad_prefs_c / widths_c, fhat, optimize=True)
+        dV += np.einsum('axg,g,ijg->axij', dareas_c,
+                        beta_c * wgrad_prefs_c, f_contracted, optimize=True)
+
+        # ===== Scalar traces for coefficient response =====
+        # d<g_g>/dR_Ax = Tr[dm * d(Gtilde_g)/dR_Ax]
+        dg_trace = np.zeros((n_atmlst, 3, C))
+
+        # Bra/ket trace
+        dPQ_s_dm = np.einsum('xijg,ij->xig', dPQ_s, dm, optimize=True)
+        dPQ_s_dm += np.einsum('xijg,ji->xig', dPQ_s, dm, optimize=True)
+        for ia, atm in enumerate(atmlst):
+            p0, p1 = aoslice[atm, 2], aoslice[atm, 3]
+            dg_trace[ia, :, :] -= np.sum(dPQ_s_dm[:, p0:p1, :], axis=1)
+        del dPQ_s_dm
+
+        # Gaussian center trace
+        dG_s_dm = np.einsum('xgij,ij->xg', dG_s, dm, optimize=True)
+        for ig in range(C):
+            atm = atom_idx_c[ig]
+            if atm in atom2idx:
+                ia = atom2idx[atm]
+                dg_trace[ia, :, ig] -= dG_s_dm[:, ig]
+        del dPQ_s, dG_s, dG_s_dm
+
+        # Width trace: wgrad * dA * Tr[dm * d(Gtilde)/d(omega)]
+        #            = wgrad * dA * (-Tr[dm * diagd])
+        diagd_dm = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
+        dg_trace -= np.einsum('axg,g->axg', dareas_c,
+                              wgrad_prefs_c * diagd_dm, optimize=True)
+        del diagd
+
+        # dF_g/dR_Ax = Tr[dm * d(Fhat_g)/dR_Ax]
+        dF_trace = np.zeros((n_atmlst, 3, C))
+
+        # Bra/ket trace
+        dPQ_p_dm = np.einsum('xijg,ij->xig', dPQ_p, dm, optimize=True)
+        dPQ_p_dm += np.einsum('xijg,ji->xig', dPQ_p, dm, optimize=True)
+        for ia, atm in enumerate(atmlst):
+            p0, p1 = aoslice[atm, 2], aoslice[atm, 3]
+            dF_trace[ia, :, :] -= np.sum(dPQ_p_dm[:, p0:p1, :], axis=1)
+        del dPQ_p_dm
+
+        # Gaussian center trace
+        dG_p_dm = np.einsum('xgij,ij->xg', dG_p, dm, optimize=True)
+        for ig in range(C):
+            atm = atom_idx_c[ig]
+            if atm in atom2idx:
+                ia = atom2idx[atm]
+                dF_trace[ia, :, ig] -= dG_p_dm[:, ig]
+        del dPQ_p, dG_p, dG_p_dm
+
+        # Width trace: wgrad * dA * Tr[dm * d(Fhat)/d(omega)]
+        # d(Fhat)/d(omega) = Fhat/omega + f_contracted
+        # Tr[dm * d(Fhat)/d(omega)] = F_g/omega + Tr[dm * f_contracted]
+        f_contracted_dm = np.einsum('ijg,ij->g', f_contracted, dm, optimize=True)
+        dF_trace += np.einsum('axg,g->axg', dareas_c,
+                              wgrad_prefs_c * (forces_c / widths_c + f_contracted_dm),
+                              optimize=True)
+        del f_contracted
+
+        # ===== Coefficient response =====
+        # dalpha/dR = P * [dA/dR / F - A * dF/dR / F^2]
+        # dbeta/dR = -P * [dA/dR * <g>/F^2 + A * d<g>/dR / F^2
+        #                  - 2*A*<g>*dF/dR / F^3]
+        inv_F = 1.0 / forces_c
+        inv_F2 = inv_F * inv_F
+        inv_F3 = inv_F2 * inv_F
+
+        dalpha = pressure * (dareas_c * inv_F
+                             - areas_c * dF_trace * inv_F2)
+
+        dbeta = -pressure * (dareas_c * gtilde_expval_c * inv_F2
+                             + areas_c * dg_trace * inv_F2
+                             - 2.0 * areas_c * gtilde_expval_c * dF_trace * inv_F3)
+
+        # Masked grid points (negative amplitudes clamped to zero by kernel())
+        # must not contribute coefficient-response derivatives.
+        # For these points, alpha=0 is a hard clamp so dalpha=0.
+        # F is frozen at 1.0, so dbeta simplifies (no dF_trace term).
+        mask_c = (amplitudes_c == 0.0)
+        if mask_c.any():
+            dalpha[:, :, mask_c] = 0.0
+            dbeta[:, :, mask_c] = -pressure * (
+                dareas_c[:, :, mask_c] * gtilde_expval_c[mask_c]
+                + areas_c[mask_c] * dg_trace[:, :, mask_c])
+
+        dV += np.einsum('axg,ijg->axij', dalpha, overlap3_s, optimize=True)
+        dV += np.einsum('axg,ijg->axij', dbeta, fhat, optimize=True)
+
+        del overlap3_s, fhat, dalpha, dbeta, dg_trace, dF_trace
+
+    # Symmetrize over AO axes (V is symmetric, so dV should be too)
+    dV = 0.5 * (dV + dV.transpose(0, 1, 3, 2))
+
+    return dV
+
+
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
     """Attach GOSTSHYP solvent model to SCF method."""
     if not isinstance(mf, scf.hf.SCF):
