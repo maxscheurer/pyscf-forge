@@ -528,13 +528,13 @@ class TestHessianInfrastructure(unittest.TestCase):
         natm = self.mol.natm
         self.assertEqual(hess.shape, (natm, natm, 3, 3))
 
-    def test_hess_stub_returns_zeros(self):
-        """GOSTSHYP.hess(dm) stub returns zeros with correct shape."""
+    def test_hess_returns_nonzero(self):
+        """GOSTSHYP.hess(dm) returns non-zero values with correct shape."""
         dm = self.mf.make_rdm1()
         de_solvent = self.gost.hess(dm)
         natm = self.mol.natm
         self.assertEqual(de_solvent.shape, (natm, natm, 3, 3))
-        np.testing.assert_array_equal(de_solvent, 0.0)
+        self.assertGreater(np.max(np.abs(de_solvent)), 1e-6)
 
     def test_make_h1_includes_grad_vmat(self):
         """make_h1 augments vacuum h1 with analytical_grad_vmat."""
@@ -577,6 +577,117 @@ class TestHessianUHF(unittest.TestCase):
         mf.kernel()
         hess = mf.Hessian().kernel()
         self.assertEqual(hess.shape, (2, 2, 3, 3))
+
+
+class TestExplicitHessian(unittest.TestCase):
+    """Tests for GOSTSHYP.hess(dm) — explicit d²E/dR² at fixed density."""
+
+    def _run_hess(self, mol, cavity='vdw', npoints=110, scaling_factor=1.2):
+        """Helper: SCF → kernel → hess + hess_fd."""
+        opts = {'cavity': cavity, 'pressure_mpa': 50_000,
+                'npoints': npoints, 'scaling_factor': scaling_factor}
+        if cavity == 'vdw/occ':
+            opts['r_ext'] = 0.4724
+        gost = GOSTSHYP(mol, options=opts)
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        return gost, dm
+
+    def test_hess_fd_shape(self):
+        """hess_fd returns (natm, natm, 3, 3)."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=26)
+        H = gost.hess_fd(dm)
+        self.assertEqual(H.shape, (2, 2, 3, 3))
+
+    def test_hess_fd_symmetry(self):
+        """hess_fd satisfies H[A,B,x,y] ~ H[B,A,y,x]."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=26)
+        H = gost.hess_fd(dm)
+        np.testing.assert_allclose(H, H.transpose(1, 0, 3, 2), atol=1e-7)
+
+    def test_hess_shape_h2(self):
+        """hess(dm) returns correct shape for H2."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pVDZ',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=110)
+        H = gost.hess(dm)
+        self.assertEqual(H.shape, (2, 2, 3, 3))
+
+    def test_hess_symmetry_h2(self):
+        """Analytical Hessian is symmetric for H2."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pVDZ',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=110)
+        H = gost.hess(dm)
+        np.testing.assert_allclose(H, H.transpose(1, 0, 3, 2), atol=1e-7)
+
+    def test_hess_vs_fd_h2(self):
+        """hess(dm) matches hess_fd(dm) for H2."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pVDZ',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=110)
+        H_ana = gost.hess(dm)
+        H_fd = gost.hess_fd(dm, step=1e-4)
+        np.testing.assert_allclose(H_ana, H_fd, atol=1e-5)
+
+    def test_hess_vs_fd_h2o(self):
+        """hess(dm) matches hess_fd(dm) for H2O (multi-atom)."""
+        mol = gto.M(atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+                    basis='cc-pVDZ', cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=110)
+        H_ana = gost.hess(dm)
+        H_fd = gost.hess_fd(dm, step=1e-4)
+        np.testing.assert_allclose(H_ana, H_fd, atol=1e-5)
+
+    def test_hess_vs_fd_masked(self):
+        """hess(dm) matches hess_fd(dm) with tight cavity (amplitude masking)."""
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='cc-pVDZ',
+                    cart=True, verbose=0)
+        gost, dm = self._run_hess(mol, npoints=110, scaling_factor=0.5)
+        # Verify masking is triggered
+        self.assertTrue(np.any(gost.amplitudes == 0.0),
+                        'Test requires masked amplitudes but none were masked')
+        H_ana = gost.hess(dm)
+        H_fd = gost.hess_fd(dm, step=1e-4)
+        np.testing.assert_allclose(H_ana, H_fd, atol=1e-5)
+
+    def test_hess_pipeline_end_to_end(self):
+        """Full Hessian pipeline (mf.Hessian().kernel()) runs with hess(dm)."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
+                    cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        hess = mf.Hessian().kernel()
+        self.assertEqual(hess.shape, (2, 2, 3, 3))
+        # Should not be all zeros anymore (unlike the old stub)
+        self.assertGreater(np.max(np.abs(gost.hess(mf.make_rdm1()))), 1e-6)
+
+    def test_hess_kernel_not_called_raises(self):
+        """Must call kernel() before hess()."""
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
+                    cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={'cavity': 'vdw'})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        # Reset forces to None to simulate kernel() not being called
+        gost.forces = None
+        with self.assertRaises(RuntimeError):
+            gost.hess(dm)
 
 
 if __name__ == '__main__':

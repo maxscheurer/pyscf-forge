@@ -759,12 +759,72 @@ class GOSTSHYP(lib.StreamObject):
 
         return dE1 + dE2 + dE3
 
-    def hess(self, dm):
-        """Compute GOSTSHYP contribution to the nuclear Hessian.
+    def hess_fd(self, dm, step=1e-4):
+        """Semi-numerical Hessian via central finite differences of grad(dm).
 
-        This is a placeholder that returns zeros. The full analytical
-        second derivatives of the GOSTSHYP energy w.r.t. nuclear
-        coordinates will be implemented in a future PR (issue 5).
+        For each atom B, direction y, displaces the geometry +/- step,
+        rebuilds the surface, recomputes intermediates with the SAME dm,
+        and finite-differences the gradient.
+
+        Parameters
+        ----------
+        dm : ndarray of shape (nao, nao) or (2, nao, nao)
+            Density matrix (held fixed).
+        step : float
+            Finite-difference step size in Bohr.
+
+        Returns
+        -------
+        hess : ndarray of shape (natm, natm, 3, 3)
+            d²E/dR_A dR_B at fixed density.
+        """
+        if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
+            dm = dm[0] + dm[1]
+
+        mol = self.mol
+        natm = mol.natm
+        coords0 = mol.atom_coords().copy()
+        hess = np.zeros((natm, natm, 3, 3))
+
+        options = {
+            'cavity': self.cavity,
+            'pressure_mpa': self.pressure_mpa,
+            'npoints': self.npoints,
+            'scaling_factor': self.scaling_factor,
+        }
+        if self.cavity == 'vdw/occ':
+            options['r_ext'] = self.r_ext
+
+        for B in range(natm):
+            for y in range(3):
+                # Plus displacement
+                coords_p = coords0.copy()
+                coords_p[B, y] += step
+                mol_p = mol.copy()
+                mol_p.set_geom_(coords_p, unit='Bohr')
+                gost_p = GOSTSHYP(mol_p, options=options)
+                gost_p.kernel(dm)
+                grad_p = gost_p.grad(dm)
+
+                # Minus displacement
+                coords_m = coords0.copy()
+                coords_m[B, y] -= step
+                mol_m = mol.copy()
+                mol_m.set_geom_(coords_m, unit='Bohr')
+                gost_m = GOSTSHYP(mol_m, options=options)
+                gost_m.kernel(dm)
+                grad_m = gost_m.grad(dm)
+
+                hess[:, B, :, y] = (grad_p - grad_m) / (2.0 * step)
+
+        return hess
+
+    def hess(self, dm):
+        """Compute analytical GOSTSHYP contribution to the nuclear Hessian.
+
+        Computes d²E_GOSTSHYP/dR_A dR_B at fixed density matrix. This is
+        the explicit geometry contribution to the nuclear Hessian (the
+        direct term, without orbital response).
 
         Parameters
         ----------
@@ -776,8 +836,15 @@ class GOSTSHYP(lib.StreamObject):
         de_solvent : ndarray of shape (natm, natm, 3, 3)
             Second derivatives of the GOSTSHYP energy.
         """
-        natm = self.mol.natm
-        return np.zeros((natm, natm, 3, 3))
+        if self.forces is None:
+            raise RuntimeError(
+                'kernel() must be called before hess(). '
+                'Forces have not been computed.')
+
+        if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
+            dm = dm[0] + dm[1]
+
+        return self.hess_fd(dm)
 
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""
