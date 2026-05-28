@@ -1073,10 +1073,8 @@ def analytical_grad_vmat(gost, dm, atmlst=None):
 
         del overlap3_s, fhat, dalpha, dbeta, dg_trace, dF_trace
 
-    # Symmetrize output (V is symmetric, so dV should be too)
-    for ia in range(n_atmlst):
-        for x in range(3):
-            dV[ia, x] = 0.5 * (dV[ia, x] + dV[ia, x].T)
+    # Symmetrize over AO axes (V is symmetric, so dV should be too)
+    dV = 0.5 * (dV + dV.transpose(0, 1, 3, 2))
 
     return dV
 
