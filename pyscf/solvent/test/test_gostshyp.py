@@ -15,7 +15,9 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf
-from pyscf.solvent.gostshyp import GOSTSHYP, gostshyp_for_scf, compute_surface_normals
+from pyscf.solvent.gostshyp import (
+    GOSTSHYP, gostshyp_for_scf, compute_surface_normals, analytical_grad_vmat
+)
 
 
 def make_hf_mol():
@@ -299,6 +301,190 @@ class TestReset(unittest.TestCase):
         e2 = mf.e_tot
         self.assertNotAlmostEqual(e1, e2, places=5)
         self.assertTrue(mf.converged)
+
+
+def _fd_grad_vmat(gost, dm, atmlst=None, eps=1e-5):
+    """Finite-difference reference for dV/dR at fixed density.
+
+    Parameters
+    ----------
+    gost : GOSTSHYP
+        GOSTSHYP object (defines cavity parameters).
+    dm : ndarray of shape (nao, nao)
+        Density matrix held fixed.
+    atmlst : list of int, optional
+        Atoms for which to compute derivatives. Default: all.
+    eps : float
+        Finite-difference step size.
+
+    Returns
+    -------
+    dV_fd : ndarray of shape (len(atmlst), 3, nao, nao)
+    """
+    mol = gost.mol
+    if atmlst is None:
+        atmlst = list(range(mol.natm))
+    nao = mol.nao_nr()
+    dV = np.zeros((len(atmlst), 3, nao, nao))
+
+    options = {
+        'cavity': gost.cavity,
+        'pressure_mpa': gost.pressure_mpa,
+        'npoints': gost.npoints,
+        'scaling_factor': gost.scaling_factor,
+    }
+    if gost.cavity == 'vdw/occ':
+        options['r_ext'] = gost.r_ext
+
+    for ia, atm in enumerate(atmlst):
+        for x in range(3):
+            coords_p = mol.atom_coords().copy()
+            coords_p[atm, x] += eps
+            mol_p = mol.copy()
+            mol_p.set_geom_(coords_p, unit='Bohr')
+            gost_p = GOSTSHYP(mol_p, options=options)
+            _, v_p = gost_p.kernel(dm)
+
+            coords_m = mol.atom_coords().copy()
+            coords_m[atm, x] -= eps
+            mol_m = mol.copy()
+            mol_m.set_geom_(coords_m, unit='Bohr')
+            gost_m = GOSTSHYP(mol_m, options=options)
+            _, v_m = gost_m.kernel(dm)
+
+            dV[ia, x] = (v_p - v_m) / (2 * eps)
+    return dV
+
+
+class TestGradVmat(unittest.TestCase):
+    """Tests for analytical_grad_vmat (dV/dR at fixed density)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mol_hf = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g',
+                            cart=True, verbose=0)
+        cls.mol_h2o = gto.M(
+            atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+            basis='6-31g', cart=True, verbose=0)
+
+    def test_shape(self):
+        """Output shape is (natm, 3, nao, nao)."""
+        gost = GOSTSHYP(self.mol_hf, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(self.mol_hf)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        dV = analytical_grad_vmat(gost, dm)
+        self.assertEqual(dV.shape, (2, 3, 11, 11))
+
+    def test_symmetry(self):
+        """Each dV[ia, x] slice must be symmetric."""
+        gost = GOSTSHYP(self.mol_hf, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(self.mol_hf)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        dV = analytical_grad_vmat(gost, dm)
+        for ia in range(2):
+            for x in range(3):
+                np.testing.assert_allclose(
+                    dV[ia, x], dV[ia, x].T, atol=1e-14,
+                    err_msg=f'dV[{ia},{x}] not symmetric')
+
+    def test_fd_hf_molecule(self):
+        """Analytic vs FD for HF molecule (cart=True, vdw cavity)."""
+        gost = GOSTSHYP(self.mol_hf, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2})
+        mf = scf.RHF(self.mol_hf)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        dV = analytical_grad_vmat(gost, dm)
+        dV_fd = _fd_grad_vmat(gost, dm)
+        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+
+    def test_fd_h2o(self):
+        """Analytic vs FD for H2O (multi-atom, asymmetric)."""
+        gost = GOSTSHYP(self.mol_h2o, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2})
+        mf = scf.RHF(self.mol_h2o)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        dV = analytical_grad_vmat(gost, dm)
+        dV_fd = _fd_grad_vmat(gost, dm)
+        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+
+    def test_fd_spherical_basis(self):
+        """Analytic vs FD with spherical harmonics (exercises c2s transform)."""
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g',
+                    cart=False, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        dV = analytical_grad_vmat(gost, dm)
+        dV_fd = _fd_grad_vmat(gost, dm)
+        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+
+    def test_fd_vdw_occ(self):
+        """Analytic vs FD with vdw/occ cavity."""
+        gost = GOSTSHYP(self.mol_hf, options={
+            'cavity': 'vdw/occ', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(self.mol_hf)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        dV = analytical_grad_vmat(gost, dm)
+        dV_fd = _fd_grad_vmat(gost, dm)
+        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+
+    def test_atmlst_subset(self):
+        """Test with atmlst selecting a subset of atoms."""
+        gost = GOSTSHYP(self.mol_h2o, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
+        mf = scf.RHF(self.mol_h2o)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        atmlst = [0, 2]
+        dV_sub = analytical_grad_vmat(gost, dm, atmlst=atmlst)
+        dV_all = analytical_grad_vmat(gost, dm)
+        self.assertEqual(dV_sub.shape, (2, 3, 13, 13))
+        np.testing.assert_allclose(dV_sub[0], dV_all[0], atol=1e-14)
+        np.testing.assert_allclose(dV_sub[1], dV_all[2], atol=1e-14)
+
+    def test_kernel_not_called_raises(self):
+        """Must call kernel() before analytical_grad_vmat."""
+        gost = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
+        dm = np.eye(self.mol_hf.nao_nr())
+        with self.assertRaises(RuntimeError):
+            analytical_grad_vmat(gost, dm)
 
 
 if __name__ == '__main__':
