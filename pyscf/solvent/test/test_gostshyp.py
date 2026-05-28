@@ -479,6 +479,26 @@ class TestGradVmat(unittest.TestCase):
         np.testing.assert_allclose(dV_sub[0], dV_all[0], atol=1e-14)
         np.testing.assert_allclose(dV_sub[1], dV_all[2], atol=1e-14)
 
+    def test_fd_masked_amplitudes(self):
+        """Analytic vs FD with tight cavity that triggers amplitude masking."""
+        gost = GOSTSHYP(self.mol_hf, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 0.5})
+        mf = scf.RHF(self.mol_hf)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+
+        # Verify masking is actually triggered
+        self.assertTrue(np.any(gost.amplitudes == 0.0),
+                        'Test requires masked amplitudes but none were masked')
+
+        dV = analytical_grad_vmat(gost, dm)
+        dV_fd = _fd_grad_vmat(gost, dm)
+        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+
     def test_kernel_not_called_raises(self):
         """Must call kernel() before analytical_grad_vmat."""
         gost = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})

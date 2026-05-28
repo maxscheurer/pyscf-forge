@@ -1057,6 +1057,17 @@ def analytical_grad_vmat(gost, dm, atmlst=None):
                              + areas_c * dg_trace * inv_F2
                              - 2.0 * areas_c * gtilde_expval_c * dF_trace * inv_F3)
 
+        # Masked grid points (negative amplitudes clamped to zero by kernel())
+        # must not contribute coefficient-response derivatives.
+        # For these points, alpha=0 is a hard clamp so dalpha=0.
+        # F is frozen at 1.0, so dbeta simplifies (no dF_trace term).
+        mask_c = (amplitudes_c == 0.0)
+        if mask_c.any():
+            dalpha[:, :, mask_c] = 0.0
+            dbeta[:, :, mask_c] = -pressure * (
+                dareas_c[:, :, mask_c] * gtilde_expval_c[mask_c]
+                + areas_c[mask_c] * dg_trace[:, :, mask_c])
+
         dV += np.einsum('axg,ijg->axij', dalpha, overlap3_s, optimize=True)
         dV += np.einsum('axg,ijg->axij', dbeta, fhat, optimize=True)
 
