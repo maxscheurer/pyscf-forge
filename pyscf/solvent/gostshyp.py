@@ -759,6 +759,26 @@ class GOSTSHYP(lib.StreamObject):
 
         return dE1 + dE2 + dE3
 
+    def hess(self, dm):
+        """Compute GOSTSHYP contribution to the nuclear Hessian.
+
+        This is a placeholder that returns zeros. The full analytical
+        second derivatives of the GOSTSHYP energy w.r.t. nuclear
+        coordinates will be implemented in a future PR (issue 5).
+
+        Parameters
+        ----------
+        dm : ndarray of shape (nao, nao) or (2, nao, nao)
+            Density matrix.
+
+        Returns
+        -------
+        de_solvent : ndarray of shape (natm, natm, 3, 3)
+            Second derivatives of the GOSTSHYP energy.
+        """
+        natm = self.mol.natm
+        return np.zeros((natm, natm, 3, 3))
+
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""
         if mol is not None:
@@ -1079,6 +1099,102 @@ def analytical_grad_vmat(gost, dm, atmlst=None):
     return dV
 
 
+class WithGOSTSHYPHess:
+    """Mixin that augments a vacuum Hessian with GOSTSHYP contributions."""
+
+    _keys = {'de_solvent', 'de_solute'}
+
+    def __init__(self, hess_method):
+        self.__dict__.update(hess_method.__dict__)
+        self.de_solvent = None
+        self.de_solute = None
+
+    def undo_solvent(self):
+        cls = self.__class__
+        name_mixin = self.base.with_solvent.__class__.__name__
+        obj = lib.view(self, lib.drop_class(cls, WithGOSTSHYPHess, name_mixin))
+        del obj.de_solvent
+        del obj.de_solute
+        return obj
+
+    def kernel(self, *args, dm=None, atmlst=None, **kwargs):
+        # GOSTSHYP has no equilibrium_solvation concept — call super directly
+        logger.debug(self, 'Compute Hessian from solutes')
+        self.de_solute = super().kernel(*args, **kwargs)
+
+        logger.debug(self, 'Compute Hessian from solvents')
+        if dm is None:
+            dm = self.base.make_rdm1(ao_repr=True)
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
+        self.de_solvent = self.base.with_solvent.hess(dm)
+        self.de = self.de_solute + self.de_solvent
+        return self.de
+
+    def make_h1(self, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+        if atmlst is None:
+            atmlst = range(self.mol.natm)
+        h1ao = super().make_h1(mo_coeff, mo_occ, atmlst=atmlst, verbose=verbose)
+
+        solvent = self.base.with_solvent
+        dm = self.base.make_rdm1(ao_repr=True)
+
+        if isinstance(self.base, scf.uhf.UHF):
+            h1aoa, h1aob = h1ao
+            dm_tot = dm[0] + dm[1]
+            dv = analytical_grad_vmat(solvent, dm_tot, atmlst=atmlst)
+            for i0, ia in enumerate(atmlst):
+                h1aoa[i0] += dv[i0]
+                h1aob[i0] += dv[i0]
+            return h1aoa, h1aob
+        else:
+            # RHF / RKS
+            dv = analytical_grad_vmat(solvent, dm, atmlst=atmlst)
+            for i0, ia in enumerate(atmlst):
+                h1ao[i0] += dv[i0]
+            return h1ao
+
+    def _finalize(self):
+        pass
+
+
+def make_hess_object(base_method):
+    """Create a GOSTSHYP-augmented Hessian object from a GOSTSHYP-attached SCF.
+
+    Parameters
+    ----------
+    base_method : SCF method
+        A GOSTSHYP-attached SCF method (the result of mf.GOSTSHYP()).
+
+    Returns
+    -------
+    hess : WithGOSTSHYPHess
+        Hessian object with GOSTSHYP contributions.
+    """
+    from pyscf.solvent._attach_solvent import _Solvation
+    from pyscf.hessian.rhf import HessianBase
+
+    if isinstance(base_method, HessianBase):
+        base_method = base_method.base
+
+    if not isinstance(base_method, _Solvation):
+        raise TypeError(
+            f'make_hess_object requires a GOSTSHYP-attached SCF method; '
+            f'got {base_method.__class__.__name__}')
+    with_solvent = base_method.with_solvent
+    if with_solvent.frozen:
+        raise RuntimeError('Frozen solvent model is not available for energy hessian')
+
+    vac_mf = base_method.undo_solvent()
+    # Call Hessian from the class (not the instance) to avoid recursion
+    # from the instance-level override we install in gostshyp_for_scf
+    vac_hess = type(vac_mf).Hessian(vac_mf)
+    vac_hess.base = base_method
+    name = with_solvent.__class__.__name__ + vac_hess.__class__.__name__
+    return lib.set_class(WithGOSTSHYPHess(vac_hess),
+                         (WithGOSTSHYPHess, vac_hess.__class__), name)
+
+
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
     """Attach GOSTSHYP solvent model to SCF method."""
     if not isinstance(mf, scf.hf.SCF):
@@ -1087,7 +1203,13 @@ def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
             f'Got {mf.__class__.__name__}')
     if solvent_obj is None:
         solvent_obj = GOSTSHYP(mf.mol)
-    return _attach_solvent._for_scf(mf, solvent_obj, dm)
+    sol_mf = _attach_solvent._for_scf(mf, solvent_obj, dm)
+
+    # Override the inherited PCM Hessian hook with GOSTSHYP's own
+    def _hessian(self):
+        return make_hess_object(self)
+    sol_mf.Hessian = _hessian.__get__(sol_mf)
+    return sol_mf
 
 
 # Inject GOSTSHYP into SCF classes

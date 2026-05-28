@@ -16,7 +16,8 @@ import unittest
 import numpy as np
 from pyscf import gto, scf
 from pyscf.solvent.gostshyp import (
-    GOSTSHYP, gostshyp_for_scf, compute_surface_normals, analytical_grad_vmat
+    GOSTSHYP, gostshyp_for_scf, compute_surface_normals, analytical_grad_vmat,
+    WithGOSTSHYPHess, make_hess_object
 )
 
 
@@ -505,6 +506,77 @@ class TestGradVmat(unittest.TestCase):
         dm = np.eye(self.mol_hf.nao_nr())
         with self.assertRaises(RuntimeError):
             analytical_grad_vmat(gost, dm)
+
+
+class TestHessianInfrastructure(unittest.TestCase):
+    """Tests for the GOSTSHYP Hessian hook and infrastructure."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g',
+                        cart=True, verbose=0)
+        cls.gost = GOSTSHYP(cls.mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
+        cls.mf = scf.RHF(cls.mol)
+        cls.mf.conv_tol = 1e-12
+        cls.mf = gostshyp_for_scf(cls.mf, cls.gost)
+        cls.mf.kernel()
+
+    def test_hessian_runs_and_shape(self):
+        """GOSTSHYP Hessian hook runs end-to-end, returns correct shape."""
+        hess = self.mf.Hessian().kernel()
+        natm = self.mol.natm
+        self.assertEqual(hess.shape, (natm, natm, 3, 3))
+
+    def test_hess_stub_returns_zeros(self):
+        """GOSTSHYP.hess(dm) stub returns zeros with correct shape."""
+        dm = self.mf.make_rdm1()
+        de_solvent = self.gost.hess(dm)
+        natm = self.mol.natm
+        self.assertEqual(de_solvent.shape, (natm, natm, 3, 3))
+        np.testing.assert_array_equal(de_solvent, 0.0)
+
+    def test_make_h1_includes_grad_vmat(self):
+        """make_h1 augments vacuum h1 with analytical_grad_vmat."""
+        hess_obj = self.mf.Hessian()
+        mo_coeff = self.mf.mo_coeff
+        mo_occ = self.mf.mo_occ
+        h1_sol = hess_obj.make_h1(mo_coeff, mo_occ)
+
+        # Compare to vacuum make_h1
+        vac_hess = hess_obj.undo_solvent()
+        h1_vac = vac_hess.make_h1(mo_coeff, mo_occ)
+
+        # Difference should be analytical_grad_vmat
+        dm = self.mf.make_rdm1()
+        self.gost.kernel(dm)
+        dv = analytical_grad_vmat(self.gost, dm)
+
+        for ia in range(self.mol.natm):
+            diff = h1_sol[ia] - h1_vac[ia]
+            np.testing.assert_allclose(diff, dv[ia], atol=1e-12,
+                                       err_msg=f'make_h1 difference != grad_vmat for atom {ia}')
+
+    def test_hessian_hook_type(self):
+        """Hessian() returns WithGOSTSHYPHess instance."""
+        hess_obj = self.mf.Hessian()
+        self.assertIsInstance(hess_obj, WithGOSTSHYPHess)
+
+
+class TestHessianUHF(unittest.TestCase):
+    """Test GOSTSHYP Hessian with UHF."""
+
+    def test_uhf_hessian_runs(self):
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g',
+                    cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.UHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        hess = mf.Hessian().kernel()
+        self.assertEqual(hess.shape, (2, 2, 3, 3))
 
 
 if __name__ == '__main__':
