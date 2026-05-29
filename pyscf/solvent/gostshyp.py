@@ -846,7 +846,8 @@ class GOSTSHYP(lib.StreamObject):
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
-        return self.hess_fd(dm)
+        from pyscf.solvent._gostshyp_hess import kernel as _hess_kernel
+        return _hess_kernel(self, dm)
 
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""
