@@ -849,6 +849,154 @@ class GOSTSHYP(lib.StreamObject):
         from pyscf.solvent._gostshyp_hess import kernel as _hess_kernel
         return _hess_kernel(self, dm)
 
+    def _B_dot_x(self, dm1):
+        """Linear response of the GOSTSHYP Fock operator to density perturbations.
+
+        Computes the matrix-vector product B·x where B is the 4-index kernel
+        ∂V_μν/∂D_κλ and x = dm1_κλ. This is needed for the CPHF equations
+        in the analytical Hessian.
+
+        The GOSTSHYP Fock matrix is:
+            V_μν(D) = Σ_g [α_g(D)·G̃_{g,μν} + β_g(D)·F̂_{g,μν}]
+
+        where α_g = P·A_g/F_g and β_g = -P·A_g·e_g/F_g².
+
+        The linear response to a density perturbation δD is:
+            δV_μν = Σ_g [δα_g·G̃_{g,μν} + δβ_g·F̂_{g,μν}]
+
+        with:
+            δe_g = Tr[δD · G̃_g]
+            δF_g = Tr[δD · F̂_g]
+            δα_g = -P·A_g/F_g² · δF_g
+            δβ_g = -P·A_g/F_g² · δe_g + 2·P·A_g·e_g/F_g³ · δF_g
+
+        Parameters
+        ----------
+        dm1 : ndarray of shape (nao, nao) or (nset, nao, nao)
+            First-order density matrix perturbation(s).
+
+        Returns
+        -------
+        vmat : ndarray, same shape as dm1
+            Linear response Fock matrix contribution(s).
+        """
+        if self.forces is None:
+            raise RuntimeError(
+                'kernel() must be called before _B_dot_x(). '
+                'Forces have not been computed.')
+
+        out_shape = dm1.shape
+        nao = self.mol.nao_nr()
+        dm1 = np.asarray(dm1).reshape(-1, nao, nao)
+        nset = dm1.shape[0]
+
+        if self.direct:
+            vmat = self._B_dot_x_direct(dm1, nset)
+        else:
+            vmat = self._B_dot_x_cached(dm1, nset)
+
+        return vmat.reshape(out_shape)
+
+    def _B_dot_x_cached(self, dm1, nset):
+        """Cached-mode implementation of _B_dot_x."""
+        nao = self.mol.nao_nr()
+        nao2 = nao * nao
+        P = self.pressure_au
+
+        Fg = self.forces
+        eg = self.gtilde_expval
+        Ag = self.areas
+
+        gtilde_2d = self.gtilde.reshape(nao2, -1, order='F')
+        fhat_2d = self.force_operators.reshape(nao2, -1, order='F')
+
+        # Common factor: P * A_g / F_g^2
+        pA_over_F2 = P * Ag / (Fg ** 2)
+        # Factor for second term of δβ: 2 * P * A_g * e_g / F_g^3
+        two_pAe_over_F3 = 2.0 * P * Ag * eg / (Fg ** 3)
+
+        vmat = np.zeros((nset, nao, nao))
+        for i in range(nset):
+            dm1_flat = dm1[i].ravel(order='F')
+            # Perturbed traces
+            d_eg = dm1_flat @ gtilde_2d     # (ngrids,)
+            d_Fg = dm1_flat @ fhat_2d       # (ngrids,)
+
+            # Perturbed amplitudes
+            d_alpha = -pA_over_F2 * d_Fg
+            d_beta = -pA_over_F2 * d_eg + two_pAe_over_F3 * d_Fg
+
+            # Assemble response Fock matrix
+            vmat[i] = (gtilde_2d @ d_alpha + fhat_2d @ d_beta
+                       ).reshape(nao, nao, order='F')
+
+        return vmat
+
+    def _B_dot_x_direct(self, dm1, nset):
+        """Integral-direct mode implementation of _B_dot_x."""
+        mol = self.mol
+        nao = mol.nao_nr()
+        nao2 = nao * nao
+        P = self.pressure_au
+
+        Fg = self.forces
+        eg = self.gtilde_expval
+        Ag = self.areas
+
+        # Common factors
+        pA_over_F2 = P * Ag / (Fg ** 2)
+        two_pAe_over_F3 = 2.0 * P * Ag * eg / (Fg ** 3)
+
+        # Chunking (same as _kernel_direct)
+        max_memreq = 5 * self.n_gaussian * nao2 * 8.0 / 1e6
+        max_memory = max(2000, mol.max_memory * 0.9 - lib.current_memory()[0])
+        n_chunks = max(1, int(max_memreq // max_memory + 1))
+
+        shells = np.arange(self.n_gaussian)
+        chunks = np.array_split(shells, n_chunks)
+
+        gmol = fakemol_for_gaussian(self.grid_coords, self.widths)
+        gmol_p = fakemol_for_gaussian(
+            self.grid_coords, self.widths, l=1, coeffs=2.0 * self.widths)
+        supermol = mol + gmol
+        supermol_p = mol + gmol_p
+
+        vmat = np.zeros((nset, nao, nao))
+
+        for shell_slice in chunks:
+            off1 = int(shell_slice[0])
+            off2 = len(shell_slice)
+            slices = (0, mol.nbas, 0, mol.nbas,
+                      mol.nbas + off1, mol.nbas + off1 + off2)
+
+            overlap3_s = supermol.intor('int3c1e', shls_slice=slices, aosym='s1')
+            overlap3_p = supermol_p.intor(
+                'int3c1e', shls_slice=slices, aosym='s1'
+            ).reshape(nao, nao, -1, 3)
+
+            normals = self.surface_normals[shell_slice]
+            force_ops = np.einsum('bkgc,gc->bkg', overlap3_p, normals,
+                                  optimize=False)
+
+            gtilde_2d = overlap3_s.reshape(nao2, -1, order='F')
+            fhat_2d = force_ops.reshape(nao2, -1, order='F')
+
+            pA_F2_c = pA_over_F2[shell_slice]
+            two_pAe_F3_c = two_pAe_over_F3[shell_slice]
+
+            for i in range(nset):
+                dm1_flat = dm1[i].ravel(order='F')
+                d_eg = dm1_flat @ gtilde_2d
+                d_Fg = dm1_flat @ fhat_2d
+
+                d_alpha = -pA_F2_c * d_Fg
+                d_beta = -pA_F2_c * d_eg + two_pAe_F3_c * d_Fg
+
+                vmat[i] += (gtilde_2d @ d_alpha + fhat_2d @ d_beta
+                            ).reshape(nao, nao, order='F')
+
+        return vmat
+
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""
         if mol is not None:
@@ -1188,9 +1336,10 @@ class WithGOSTSHYPHess:
         return obj
 
     def kernel(self, *args, dm=None, atmlst=None, **kwargs):
-        # GOSTSHYP has no equilibrium_solvation concept — call super directly
-        logger.debug(self, 'Compute Hessian from solutes')
-        self.de_solute = super().kernel(*args, **kwargs)
+        # Enable equilibrium_solvation during CPHF so gen_response calls _B_dot_x
+        logger.debug(self, 'Compute Hessian from solutes (with GOSTSHYP CPHF response)')
+        with lib.temporary_env(self.base.with_solvent, equilibrium_solvation=True):
+            self.de_solute = super().kernel(*args, **kwargs)
 
         logger.debug(self, 'Compute Hessian from solvents')
         if dm is None:

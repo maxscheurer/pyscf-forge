@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Derivation of GOSTSHYP _B_dot_x (linear response kernel)</title>
+<script>
+MathJax = { tex: { inlineMath: [['$', '$']], displayMath: [['$$', '$$']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+body { max-width: 800px; margin: 40px auto; font-family: serif; font-size: 18px; line-height: 1.6; padding: 0 20px; }
+h1, h2, h3 { font-family: sans-serif; }
+.derivation { background: #f8f8f8; padding: 15px; border-left: 3px solid #666; margin: 15px 0; }
+.result { background: #e8f5e9; padding: 15px; border-left: 3px solid #4caf50; margin: 15px 0; }
+.note { background: #fff3e0; padding: 15px; border-left: 3px solid #ff9800; margin: 15px 0; }
+</style>
+</head>
+<body>
+
+<h1>Derivation of <code>_B_dot_x(δD)</code></h1>
+<p>The GOSTSHYP linear response kernel: element-wise derivative of the Fock operator with respect to the density matrix, contracted with a perturbation.</p>
+
+<h2>1. The GOSTSHYP Fock matrix element</h2>
+
+<p>Each element of the GOSTSHYP Fock contribution is:</p>
+$$
+V_{\mu\nu}(D) = \sum_g \left[ \alpha_g(D) \, \tilde{G}_{g,\mu\nu} + \beta_g(D) \, \hat{F}_{g,\mu\nu} \right]
+$$
+
+<p>where:</p>
+$$
+\alpha_g(D) = \frac{P \, A_g}{F_g(D)}, \qquad
+\beta_g(D) = -\frac{P \, A_g \, e_g(D)}{F_g(D)^2}
+$$
+
+<p>and the $D$-dependent scalars are:</p>
+$$
+e_g(D) = \sum_{kl} D_{kl} \, \tilde{G}_{g,kl}, \qquad
+F_g(D) = \sum_{kl} D_{kl} \, \hat{F}_{g,kl}
+$$
+
+<div class="note">
+<strong>What depends on $D$?</strong> Only $e_g$ and $F_g$ (and through them, $\alpha_g$ and $\beta_g$). The integral matrices $\tilde{G}_{g,\mu\nu}$ and $\hat{F}_{g,\mu\nu}$ are geometry-dependent only.
+</div>
+
+<h2>2. Element-wise derivative $\partial V_{\mu\nu} / \partial D_{\eta\gamma}$</h2>
+
+<p>We need:</p>
+$$
+\frac{\partial V_{\mu\nu}}{\partial D_{\eta\gamma}} = \sum_g \left[
+  \frac{\partial \alpha_g}{\partial D_{\eta\gamma}} \, \tilde{G}_{g,\mu\nu}
+  + \frac{\partial \beta_g}{\partial D_{\eta\gamma}} \, \hat{F}_{g,\mu\nu}
+\right]
+$$
+
+<h3>2a. Derivatives of the scalars w.r.t. $D_{\kappa\lambda}$</h3>
+
+<div class="derivation">
+$$
+\frac{\partial e_g}{\partial D_{\kappa\lambda}} = \tilde{G}_{g,\kappa\lambda}
+$$
+$$
+\frac{\partial F_g}{\partial D_{\kappa\lambda}} = \hat{F}_{g,\kappa\lambda}
+$$
+</div>
+
+<p>These follow directly from the definitions: $e_g = \sum_{kl} D_{kl} \tilde{G}_{g,kl}$ is linear in $D$.</p>
+
+<h3>2b. Derivative of $\alpha_g$</h3>
+
+<div class="derivation">
+$$
+\frac{\partial \alpha_g}{\partial D_{\kappa\lambda}}
+= P \, A_g \, \frac{\partial}{\partial D_{\kappa\lambda}} \left( F_g^{-1} \right)
+= P \, A_g \, \left( -F_g^{-2} \right) \, \frac{\partial F_g}{\partial D_{\kappa\lambda}}
+$$
+</div>
+
+<div class="result">
+$$
+\frac{\partial \alpha_g}{\partial D_{\kappa\lambda}} = -\frac{P \, A_g}{F_g^2} \, \hat{F}_{g,\kappa\lambda}
+$$
+</div>
+
+<h3>2c. Derivative of $\beta_g$</h3>
+
+<div class="derivation">
+$$
+\beta_g = -P \, A_g \, e_g \, F_g^{-2}
+$$
+
+<p>Product rule on $e_g \cdot F_g^{-2}$:</p>
+
+$$
+\frac{\partial \beta_g}{\partial D_{\kappa\lambda}}
+= -P \, A_g \left[
+  \frac{\partial e_g}{\partial D_{\kappa\lambda}} \cdot F_g^{-2}
+  + e_g \cdot \left(-2 F_g^{-3}\right) \frac{\partial F_g}{\partial D_{\kappa\lambda}}
+\right]
+$$
+</div>
+
+<div class="result">
+$$
+\frac{\partial \beta_g}{\partial D_{\kappa\lambda}}
+= -\frac{P \, A_g}{F_g^2} \, \tilde{G}_{g,\kappa\lambda}
++ \frac{2 \, P \, A_g \, e_g}{F_g^3} \, \hat{F}_{g,\kappa\lambda}
+$$
+</div>
+
+<h2>3. The full 4-index object</h2>
+
+<p>Substituting back:</p>
+
+$$
+\frac{\partial V_{\mu\nu}}{\partial D_{\kappa\lambda}} = \sum_g \left[
+  -\frac{P A_g}{F_g^2} \, \hat{F}_{g,\kappa\lambda} \, \tilde{G}_{g,\mu\nu}
+  + \left( -\frac{P A_g}{F_g^2} \, \tilde{G}_{g,\kappa\lambda} + \frac{2 P A_g e_g}{F_g^3} \, \hat{F}_{g,\kappa\lambda} \right) \hat{F}_{g,\mu\nu}
+\right]
+$$
+
+<p>Rearranging by which integral matrix carries the $(\kappa\lambda)$ index:</p>
+
+$$
+\frac{\partial V_{\mu\nu}}{\partial D_{\kappa\lambda}} = \sum_g P A_g \left[
+  -\frac{1}{F_g^2} \, \hat{F}_{g,\kappa\lambda} \, \tilde{G}_{g,\mu\nu}
+  -\frac{1}{F_g^2} \, \tilde{G}_{g,\kappa\lambda} \, \hat{F}_{g,\mu\nu}
+  + \frac{2 e_g}{F_g^3} \, \hat{F}_{g,\kappa\lambda} \, \hat{F}_{g,\mu\nu}
+\right]
+$$
+
+<div class="note">
+<strong>Structure:</strong> This is a rank-2 tensor in $(\mu\nu)$ and a rank-2 tensor in $(\kappa\lambda)$, summed over grid points $g$. Each term is a product of an integral matrix at $(\mu\nu)$ with an integral matrix at $(\kappa\lambda)$.
+</div>
+
+<h2>4. Contraction with the perturbation: <code>_B_dot_x(δD)</code></h2>
+
+<p>The linear response is:</p>
+$$
+\texttt{B\_dot\_x}(\delta D)_{\mu\nu} = \sum_{\kappa\lambda} \frac{\partial V_{\mu\nu}}{\partial D_{\kappa\lambda}} \, \delta D_{\kappa\lambda}
+$$
+
+<p>Defining the perturbed traces (contracting over $\kappa\lambda$):</p>
+$$
+\delta e_g \equiv \sum_{\kappa\lambda} \delta D_{\kappa\lambda} \, \tilde{G}_{g,\kappa\lambda} = \mathrm{Tr}[\delta D \cdot \tilde{G}_g]
+$$
+$$
+\delta F_g \equiv \sum_{\kappa\lambda} \delta D_{\kappa\lambda} \, \hat{F}_{g,\kappa\lambda} = \mathrm{Tr}[\delta D \cdot \hat{F}_g]
+$$
+
+<p>we get:</p>
+
+<div class="result">
+$$
+\boxed{
+\texttt{B\_dot\_x}(\delta D)_{\mu\nu} = \sum_g P A_g \left[
+  -\frac{\delta F_g}{F_g^2} \, \tilde{G}_{g,\mu\nu}
+  -\frac{\delta e_g}{F_g^2} \, \hat{F}_{g,\mu\nu}
+  + \frac{2 \, e_g \, \delta F_g}{F_g^3} \, \hat{F}_{g,\mu\nu}
+\right]
+}
+$$
+</div>
+
+<p>Or equivalently, defining per-grid-point amplitude perturbations:</p>
+$$
+\delta\alpha_g = -\frac{P A_g}{F_g^2} \, \delta F_g
+$$
+$$
+\delta\beta_g = -\frac{P A_g}{F_g^2} \, \delta e_g + \frac{2 P A_g \, e_g}{F_g^3} \, \delta F_g
+$$
+$$
+\texttt{B\_dot\_x}(\delta D)_{\mu\nu} = \sum_g \left[ \delta\alpha_g \, \tilde{G}_{g,\mu\nu} + \delta\beta_g \, \hat{F}_{g,\mu\nu} \right]
+$$
+
+<h2>5. Verification</h2>
+
+<h3>5a. Consistency with <code>analytical_grad_vmat</code></h3>
+
+<p>In the gradient code, the "coefficient response" computes $\partial\alpha_g/\partial R$ and $\partial\beta_g/\partial R$ at fixed $D$. Those are:</p>
+$$
+\frac{\partial\alpha_g}{\partial R} = P \left[\frac{\partial A_g/\partial R}{F_g} - \frac{A_g \, \partial F_g/\partial R}{F_g^2}\right]
+$$
+$$
+\frac{\partial\beta_g}{\partial R} = -P \left[\frac{(\partial A_g/\partial R) \, e_g}{F_g^2} + \frac{A_g \, (\partial e_g/\partial R)}{F_g^2} - \frac{2 A_g \, e_g \, (\partial F_g/\partial R)}{F_g^3}\right]
+$$
+
+<p>Our $\delta\beta_g$ matches the last two terms (with $\partial e_g/\partial R \to \delta e_g$, $\partial F_g/\partial R \to \delta F_g$),
+and correctly has no $\partial A_g$ terms because $A_g$ does not depend on $D$. ✓</p>
+
+<h3>5b. Finite-difference test</h3>
+$$
+\texttt{B\_dot\_x}(\delta D) \approx \frac{V(D + \varepsilon\,\delta D) - V(D - \varepsilon\,\delta D)}{2\varepsilon}
+$$
+
+<h3>5c. Symmetry</h3>
+<p>Since $\tilde{G}_g$ and $\hat{F}_g$ are symmetric in $(\mu\nu)$, the result is symmetric. ✓</p>
+
+<h3>5d. The response is symmetric in the perturbation indices</h3>
+<p>Is $\partial V_{\mu\nu}/\partial D_{\kappa\lambda} = \partial V_{\mu\nu}/\partial D_{\lambda\kappa}$?</p>
+<p>Yes, because $\tilde{G}_{g,\kappa\lambda} = \tilde{G}_{g,\lambda\kappa}$ and $\hat{F}_{g,\kappa\lambda} = \hat{F}_{g,\lambda\kappa}$ (the integral matrices are symmetric). So the response only depends on the symmetric part of $\delta D$. ✓</p>
+
+</body>
+</html>
