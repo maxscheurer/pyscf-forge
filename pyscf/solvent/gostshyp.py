@@ -72,7 +72,8 @@ def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
     ang_norm = {0: 2.0 * np.sqrt(np.pi),
                 1: 2.0 * np.sqrt(np.pi / 3),
                 2: 1.0,
-                3: 1.0}
+                3: 1.0,
+                4: 1.0}
 
     fakeatm = np.zeros((nbas, gto.mole.ATM_SLOTS), dtype=np.int32)
     fakebas = np.zeros((nbas, gto.mole.BAS_SLOTS), dtype=np.int32)
