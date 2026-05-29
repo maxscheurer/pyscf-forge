@@ -161,7 +161,7 @@ def compute_h5_contracted_dm(gost, dm, mol):
     return h5_dm
 
 
-def compute_d2F_analytical(gost, dm, mol):
+def compute_d2F_analytical(gost, dm, mol, force_thresh=None):
     """Compute d²F_g/(dR_Ax dR_By) analytically — ALL terms.
 
     Returns shape (natm, natm, 3, 3, ngrids).
@@ -199,6 +199,18 @@ def compute_d2F_analytical(gost, dm, mol):
         _, dareas_raw = get_dF_dA(gost.surface_dict)
         dareas = dareas_raw.transpose(1, 2, 0)  # (natm, 3, ngrids)
         _, d2A = get_d2F_d2A(gost.surface_dict)
+
+    # Conditioning guard: at grid points where the force trace F_g is
+    # negligible, the omega-derivative quantities (dFhat/dω, d²Fhat/dω²)
+    # are at machine noise level — the p-type integrals contracted with
+    # normals nearly cancel at these points.  Since wgrad_prefs ~ 1/A²
+    # can be enormous at the same points (small area), the product
+    # (dω)^n · (d^n F/dω^n) amplifies float residuals into visible
+    # artifacts.  We zero out the width-response terms (G2–G5) at these
+    # grid points.  G1 (position × position) is always well-conditioned.
+    if force_thresh is None:
+        force_thresh = 1e-9
+    stable = forces > force_thresh
 
     d2F = np.zeros((natm, natm, 3, 3, ngrids))
 
@@ -403,6 +415,8 @@ def compute_d2F_analytical(gost, dm, mol):
 
     # Combine: d_dFhat_domega_dm_pos = (1/ω) · dF_pos + d_f_dm_pos
     d_dFhat_domega_dm_pos = dF_pos / widths + d_f_dm_pos
+    # Zero at numerically unstable points
+    d_dFhat_domega_dm_pos[:, :, ~stable] = 0.0
 
     # G2: dω/dR_By · Tr[D · ∂²F/(∂pos_Ax ∂ω)]
     # = wgrad_prefs · dA[B,y] · d_dFhat_domega_dm_pos[A,x]
@@ -422,6 +436,8 @@ def compute_d2F_analytical(gost, dm, mol):
     # =====================================================================
     f_contracted_dm = compute_f_contracted_dm(gost, dm, mol)
     dFhat_domega_trace = forces / widths + f_contracted_dm
+    # Zero at numerically unstable points
+    dFhat_domega_trace[~stable] = 0.0
 
     # Sub-term G4a: (-2·wgp/A · dA[A,x] · dA[B,y]) · dFhat_domega_trace
     d2F += np.einsum('g,Axg,Byg,g->ABxyg',
@@ -440,6 +456,8 @@ def compute_d2F_analytical(gost, dm, mol):
     # =====================================================================
     h5_dm = compute_h5_contracted_dm(gost, dm, mol)
     d2Fhat_domega2_trace = 2.0 * f_contracted_dm / widths + h5_dm
+    # Zero at numerically unstable points
+    d2Fhat_domega2_trace[~stable] = 0.0
 
     # G5: wgp·dA[A,x] · wgp·dA[B,y] · d2Fhat_domega2_trace
     d2F += np.einsum('g,Axg,g,Byg,g->ABxyg',
