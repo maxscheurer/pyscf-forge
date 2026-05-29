@@ -72,6 +72,7 @@ def assemble_hessian(gost, dm, mol, d2e=None, d2F=None):
         _, dareas_raw = get_dF_dA(gost._outer_surface_dict)
         dA = dareas_raw.transpose(1, 2, 0) * gost._occ_ratio_sq
         _, d2A = get_d2F_d2A(gost._outer_surface_dict)
+        d2A = d2A * gost._occ_ratio_sq
     else:
         _, dareas_raw = get_dF_dA(gost.surface_dict)
         dA = dareas_raw.transpose(1, 2, 0)  # (natm, 3, ngrids)

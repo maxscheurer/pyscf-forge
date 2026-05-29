@@ -11,7 +11,7 @@ from pyscf.solvent.gostshyp import GOSTSHYP, fakemol_for_gaussian
 from pyscf.solvent.grad.pcm import get_dF_dA
 
 
-def make_h2_system(cavity='vdw', npoints=110, scaling_factor=1.2,
+def make_h2_system(cavity='vdw/occ', npoints=110, scaling_factor=1.2,
                    pressure_mpa=50_000):
     """Set up H2/sto-3g with GOSTSHYP, return (gost, dm, mol)."""
     mol = gto.M(
@@ -37,7 +37,7 @@ def make_h2_system(cavity='vdw', npoints=110, scaling_factor=1.2,
     return gost, dm, mol
 
 
-def make_h2o_system(cavity='vdw', npoints=110, scaling_factor=1.2,
+def make_h2o_system(cavity='vdw/occ', npoints=110, scaling_factor=1.2,
                     pressure_mpa=50_000):
     """Set up H2O/cc-pVDZ with GOSTSHYP, return (gost, dm, mol)."""
     mol = gto.M(
