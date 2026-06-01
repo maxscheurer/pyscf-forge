@@ -76,7 +76,7 @@ def generate(system_name):
     mf = system.make_mf()
     gost = mf.with_solvent
     print(f'    E = {mf.e_tot:.10f}, ngrids = {gost.n_gaussian}, '
-          f'min_area = {gost.areas.min():.3e}')
+          f'min_area = {gost.areas.min():.3e}, area_thresh = {gost.area_thresh:.3e}')
 
     t0 = time.time()
     hess_num = numerical_hessian(mol, gost_opts)

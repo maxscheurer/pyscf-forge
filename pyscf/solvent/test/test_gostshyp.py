@@ -35,7 +35,7 @@ class TestGOSTSHYP_VDW(unittest.TestCase):
         cls.mol = make_hf_mol()
         cls.gost = GOSTSHYP(cls.mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2})
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': None})
         cls.mf = scf.RHF(cls.mol)
         cls.mf.conv_tol = 1e-12
         cls.mf.conv_tol_grad = 1e-8
@@ -71,7 +71,7 @@ class TestGOSTSHYP_VDW(unittest.TestCase):
 
         gost_direct = GOSTSHYP(self.mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2, 'direct': True})
+            'npoints': 110, 'scaling_factor': 1.2, 'direct': True, 'area_thresh': None})
         e_direct, f_direct = gost_direct.kernel(dm)
 
         np.testing.assert_allclose(e_direct, e_cached, atol=1e-12)
@@ -163,7 +163,7 @@ class TestDirectGradient(unittest.TestCase):
         mol = make_hf_mol()
         gost = GOSTSHYP(mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2, 'direct': True})
+            'npoints': 110, 'scaling_factor': 1.2, 'direct': True, 'area_thresh': None})
         mf = scf.RHF(mol)
         mf.conv_tol = 1e-12
         mf = gostshyp_for_scf(mf, gost)
@@ -219,7 +219,7 @@ class TestFiniteDifferenceOCC(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -235,7 +235,7 @@ class TestSphericalHarmonics(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -252,7 +252,7 @@ class TestMultiAtom(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -283,7 +283,7 @@ class TestNegativeAmplitudeMasking(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -406,19 +406,11 @@ def test_grad_vmat_vs_fd(system_name):
     gost, dm, mol = _make_gost(system_name)
     dV_ana = analytical_grad_vmat(gost, dm)
     dV_fd = _fd_over_geometry(gost, dm, lambda g, d: g.v)
+    np.testing.assert_allclose(
+        dV_ana, dV_ana.transpose(0, 1, 3, 2), atol=1e-14,
+        err_msg=f'dV not symmetric'
+    )
     np.testing.assert_allclose(dV_ana, dV_fd, atol=1e-7)
-
-
-@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
-def test_grad_vmat_symmetry(system_name):
-    """Each dV[ia, x] slice is symmetric."""
-    gost, dm, mol = _make_gost(system_name)
-    dV = analytical_grad_vmat(gost, dm)
-    for ia in range(mol.natm):
-        for x in range(3):
-            np.testing.assert_allclose(
-                dV[ia, x], dV[ia, x].T, atol=1e-14,
-                err_msg=f'dV[{ia},{x}] not symmetric')
 
 
 def test_grad_vmat_atmlst_subset():
@@ -453,7 +445,7 @@ def test_grad_vmat_masked_amplitudes():
     mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=True, verbose=0)
     gost = GOSTSHYP(mol, options={
         'cavity': 'vdw', 'pressure_mpa': 50_000,
-        'npoints': 110, 'scaling_factor': 0.5})
+        'npoints': 110, 'scaling_factor': 0.5, 'area_thresh': None})
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
     mf = gostshyp_for_scf(mf, gost)
@@ -570,7 +562,7 @@ def test_hess_vs_fd_masked():
                 cart=True, verbose=0)
     gost = GOSTSHYP(mol, options={
         'cavity': 'vdw', 'pressure_mpa': 50_000,
-        'npoints': 110, 'scaling_factor': 0.5})
+        'npoints': 110, 'scaling_factor': 0.5, 'area_thresh': None})
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
     mf = gostshyp_for_scf(mf, gost)

@@ -19,6 +19,7 @@ class GOSTSHYPOptions:
     pressure_mpa: float = 50_000
     npoints: int = 110
     scaling_factor: float = 1.2
+    area_thresh: float = 1e-3
     r_ext: float = 0.4724  # only used for vdw/occ
 
     def to_dict(self):
