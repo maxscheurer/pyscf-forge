@@ -19,10 +19,11 @@ import sys
 import time
 
 import numpy as np
+from tqdm import tqdm
 from pyscf import gto, scf
 from pyscf.solvent.gostshyp import GOSTSHYP
 
-from pyscf.solvent.test.reference_systems import SYSTEMS, make_mf
+from pyscf.solvent.test.reference_systems import SYSTEMS
 
 
 REFERENCE_DIR = os.path.join(os.path.dirname(__file__), 'reference_data')
@@ -34,7 +35,7 @@ def numerical_hessian(mol, gost_opts, step=1e-4):
     coords0 = mol.atom_coords().copy()
     hess = np.zeros((natm, 3, natm, 3))
 
-    for B in range(natm):
+    for B in tqdm(range(natm), desc='    fdiff', leave=False):
         for y in range(3):
             for sign, s in [(+1, step), (-1, -step)]:
                 coords = coords0.copy()
@@ -65,15 +66,15 @@ def numerical_hessian(mol, gost_opts, step=1e-4):
 
 def generate(system_name):
     """Generate and save a reference Hessian for one system."""
-    sys_def = SYSTEMS[system_name]
-    mol = gto.M(atom=sys_def['atom'], basis=sys_def['basis'],
-                unit=sys_def['unit'], verbose=0)
-    gost_opts = sys_def['gostshyp']
+    system = SYSTEMS[system_name]
+    mol = gto.M(atom=system.atom, basis=system.basis,
+                unit=system.unit, verbose=0)
+    gost_opts = system.gostshyp.to_dict()
 
-    print(f'  {system_name}: {mol.natm} atoms, basis={sys_def["basis"]}')
+    print(f'  {system_name}: {mol.natm} atoms, basis={system.basis}')
 
     # Also compute analytical for comparison
-    mf = make_mf(system_name)
+    mf = system.make_mf()
     gost = mf.with_solvent
     print(f'    E = {mf.e_tot:.10f}, ngrids = {gost.n_gaussian}, '
           f'min_area = {gost.areas.min():.3e}')
@@ -116,10 +117,10 @@ def main():
                 sys.exit(1)
     else:
         print('Available systems:')
-        for name, sys_def in SYSTEMS.items():
+        for name, system in SYSTEMS.items():
             path = os.path.join(REFERENCE_DIR, f'hess_{name}.npy')
             exists = '✓' if os.path.exists(path) else '✗'
-            print(f'  [{exists}] {name}: {sys_def["atom"][:40]}...')
+            print(f'  [{exists}] {name} ({system.molecule}/{system.basis})')
         print(f'\nUse --systems name1 name2 or --all')
         return
 
