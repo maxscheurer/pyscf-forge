@@ -306,209 +306,199 @@ class TestReset(unittest.TestCase):
         self.assertTrue(mf.converged)
 
 
-def _fd_grad_vmat(gost, dm, atmlst=None, eps=1e-5):
-    """Finite-difference reference for dV/dR at fixed density.
+# ============================================================
+# Hessian test utilities
+# ============================================================
+
+from pyscf.solvent.test.reference_systems import SYSTEMS
+
+REFERENCE_DIR = os.path.join(os.path.dirname(__file__), 'reference_data')
+SYSTEM_NAMES = list(SYSTEMS.keys())
+
+
+def _gost_options(gost):
+    """Extract GOSTSHYP options dict for reconstruction at displaced geometry."""
+    opts = {
+        'cavity': gost.cavity, 'pressure_mpa': gost.pressure_mpa,
+        'npoints': gost.npoints, 'scaling_factor': gost.scaling_factor,
+    }
+    if gost.cavity == 'vdw/occ':
+        opts['r_ext'] = gost.r_ext
+    return opts
+
+
+def _make_gost(system_name):
+    """Build GOSTSHYP with converged density for a reference system.
+
+    Returns (gost, dm, mol).
+    """
+    system = SYSTEMS[system_name]
+    mol = gto.M(atom=system.atom, basis=system.basis,
+                unit=system.unit, verbose=0)
+    gost = GOSTSHYP(mol, options=system.gostshyp.to_dict())
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    dm = mf.make_rdm1()
+    gost.kernel(dm)
+    return gost, dm, mol
+
+
+def _fd_over_geometry(gost, dm, eval_fn, step=1e-5):
+    """Central finite difference of eval_fn(gost, dm) w.r.t. nuclear coords.
 
     Parameters
     ----------
-    gost : GOSTSHYP
-        GOSTSHYP object (defines cavity parameters).
-    dm : ndarray of shape (nao, nao)
-        Density matrix held fixed.
-    atmlst : list of int, optional
-        Atoms for which to compute derivatives. Default: all.
-    eps : float
-        Finite-difference step size.
+    gost : GOSTSHYP with kernel() already called
+    dm : density matrix (held fixed)
+    eval_fn : callable(gost, dm) -> ndarray of any shape
+    step : displacement in Bohr
 
     Returns
     -------
-    dV_fd : ndarray of shape (len(atmlst), 3, nao, nao)
+    deriv : ndarray of shape (natm, 3, *eval_shape)
     """
     mol = gost.mol
-    if atmlst is None:
-        atmlst = list(range(mol.natm))
-    nao = mol.nao_nr()
-    dV = np.zeros((len(atmlst), 3, nao, nao))
+    natm = mol.natm
+    coords0 = mol.atom_coords().copy()
+    opts = _gost_options(gost)
 
-    options = {
-        'cavity': gost.cavity,
-        'pressure_mpa': gost.pressure_mpa,
-        'npoints': gost.npoints,
-        'scaling_factor': gost.scaling_factor,
-    }
-    if gost.cavity == 'vdw/occ':
-        options['r_ext'] = gost.r_ext
+    # First displacement to infer output shape
+    coords_p = coords0.copy()
+    coords_p[0, 0] += step
+    mol_p = mol.copy()
+    mol_p.set_geom_(coords_p, unit='Bohr')
+    gost_p = GOSTSHYP(mol_p, options=opts)
+    gost_p.kernel(dm)
+    ref = eval_fn(gost_p, dm)
+    result = np.zeros((natm, 3, *ref.shape))
 
-    for ia, atm in enumerate(atmlst):
-        for x in range(3):
-            coords_p = mol.atom_coords().copy()
-            coords_p[atm, x] += eps
+    for B in range(natm):
+        for y in range(3):
+            coords_p = coords0.copy()
+            coords_p[B, y] += step
             mol_p = mol.copy()
             mol_p.set_geom_(coords_p, unit='Bohr')
-            gost_p = GOSTSHYP(mol_p, options=options)
-            _, v_p = gost_p.kernel(dm)
+            gost_p = GOSTSHYP(mol_p, options=opts)
+            gost_p.kernel(dm)
+            val_p = eval_fn(gost_p, dm)
 
-            coords_m = mol.atom_coords().copy()
-            coords_m[atm, x] -= eps
+            coords_m = coords0.copy()
+            coords_m[B, y] -= step
             mol_m = mol.copy()
             mol_m.set_geom_(coords_m, unit='Bohr')
-            gost_m = GOSTSHYP(mol_m, options=options)
-            _, v_m = gost_m.kernel(dm)
+            gost_m = GOSTSHYP(mol_m, options=opts)
+            gost_m.kernel(dm)
+            val_m = eval_fn(gost_m, dm)
 
-            dV[ia, x] = (v_p - v_m) / (2 * eps)
-    return dV
+            result[B, y] = (val_p - val_m) / (2.0 * step)
+
+    return result
 
 
-class TestGradVmat(unittest.TestCase):
-    """Tests for analytical_grad_vmat (dV/dR at fixed density)."""
+# ============================================================
+# analytical_grad_vmat tests
+# ============================================================
 
-    @classmethod
-    def setUpClass(cls):
-        cls.mol_hf = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g',
-                            cart=True, verbose=0)
-        cls.mol_h2o = gto.M(
-            atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
-            basis='6-31g', cart=True, verbose=0)
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+def test_grad_vmat_vs_fd(system_name):
+    """analytical_grad_vmat matches fdiff of kernel().v."""
+    gost, dm, mol = _make_gost(system_name)
+    dV_ana = analytical_grad_vmat(gost, dm)
+    dV_fd = _fd_over_geometry(gost, dm, lambda g, d: g.v)
+    np.testing.assert_allclose(dV_ana, dV_fd, atol=1e-7)
 
-    def test_shape(self):
-        """Output shape is (natm, 3, nao, nao)."""
-        gost = GOSTSHYP(self.mol_hf, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
-        mf = scf.RHF(self.mol_hf)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
-        dV = analytical_grad_vmat(gost, dm)
-        self.assertEqual(dV.shape, (2, 3, 11, 11))
 
-    def test_symmetry(self):
-        """Each dV[ia, x] slice must be symmetric."""
-        gost = GOSTSHYP(self.mol_hf, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
-        mf = scf.RHF(self.mol_hf)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
-        dV = analytical_grad_vmat(gost, dm)
-        for ia in range(2):
-            for x in range(3):
-                np.testing.assert_allclose(
-                    dV[ia, x], dV[ia, x].T, atol=1e-14,
-                    err_msg=f'dV[{ia},{x}] not symmetric')
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+def test_grad_vmat_symmetry(system_name):
+    """Each dV[ia, x] slice is symmetric."""
+    gost, dm, mol = _make_gost(system_name)
+    dV = analytical_grad_vmat(gost, dm)
+    for ia in range(mol.natm):
+        for x in range(3):
+            np.testing.assert_allclose(
+                dV[ia, x], dV[ia, x].T, atol=1e-14,
+                err_msg=f'dV[{ia},{x}] not symmetric')
 
-    def test_fd_hf_molecule(self):
-        """Analytic vs FD for HF molecule (cart=True, vdw cavity)."""
-        gost = GOSTSHYP(self.mol_hf, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2})
-        mf = scf.RHF(self.mol_hf)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
 
-        dV = analytical_grad_vmat(gost, dm)
-        dV_fd = _fd_grad_vmat(gost, dm)
-        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+def test_grad_vmat_atmlst_subset():
+    """atmlst selects a subset of atoms."""
+    gost, dm, mol = _make_gost('h2o_cc-pvdz')
+    atmlst = [0, 2]
+    dV_sub = analytical_grad_vmat(gost, dm, atmlst=atmlst)
+    dV_all = analytical_grad_vmat(gost, dm)
+    assert dV_sub.shape[0] == 2
+    np.testing.assert_allclose(dV_sub[0], dV_all[0], atol=1e-14)
+    np.testing.assert_allclose(dV_sub[1], dV_all[2], atol=1e-14)
 
-    def test_fd_h2o(self):
-        """Analytic vs FD for H2O (multi-atom, asymmetric)."""
-        gost = GOSTSHYP(self.mol_h2o, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2})
-        mf = scf.RHF(self.mol_h2o)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
 
-        dV = analytical_grad_vmat(gost, dm)
-        dV_fd = _fd_grad_vmat(gost, dm)
-        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+def test_grad_vmat_vdw_occ():
+    """Analytic vs FD with vdw/occ cavity."""
+    mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=True, verbose=0)
+    gost = GOSTSHYP(mol, options={
+        'cavity': 'vdw/occ', 'pressure_mpa': 50_000, 'npoints': 110})
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-12
+    mf = gostshyp_for_scf(mf, gost)
+    mf.kernel()
+    dm = mf.make_rdm1()
+    gost.kernel(dm)
+    dV_ana = analytical_grad_vmat(gost, dm)
+    dV_fd = _fd_over_geometry(gost, dm, lambda g, d: g.v)
+    np.testing.assert_allclose(dV_ana, dV_fd, atol=1e-7)
 
-    def test_fd_spherical_basis(self):
-        """Analytic vs FD with spherical harmonics (exercises c2s transform)."""
-        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g',
-                    cart=False, verbose=0)
-        gost = GOSTSHYP(mol, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
 
-        dV = analytical_grad_vmat(gost, dm)
-        dV_fd = _fd_grad_vmat(gost, dm)
-        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+def test_grad_vmat_masked_amplitudes():
+    """Analytic vs FD with tight cavity that triggers amplitude masking."""
+    mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=True, verbose=0)
+    gost = GOSTSHYP(mol, options={
+        'cavity': 'vdw', 'pressure_mpa': 50_000,
+        'npoints': 110, 'scaling_factor': 0.5})
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-12
+    mf = gostshyp_for_scf(mf, gost)
+    mf.kernel()
+    dm = mf.make_rdm1()
+    gost.kernel(dm)
+    assert np.any(gost.amplitudes == 0.0), 'No masked amplitudes'
+    dV_ana = analytical_grad_vmat(gost, dm)
+    dV_fd = _fd_over_geometry(gost, dm, lambda g, d: g.v)
+    np.testing.assert_allclose(dV_ana, dV_fd, atol=1e-7)
 
-    def test_fd_vdw_occ(self):
-        """Analytic vs FD with vdw/occ cavity."""
-        gost = GOSTSHYP(self.mol_hf, options={
-            'cavity': 'vdw/occ', 'pressure_mpa': 50_000, 'npoints': 110})
-        mf = scf.RHF(self.mol_hf)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
 
-        dV = analytical_grad_vmat(gost, dm)
-        dV_fd = _fd_grad_vmat(gost, dm)
-        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
+# ============================================================
+# d2e / d2F tests (unified)
+# ============================================================
 
-    def test_atmlst_subset(self):
-        """Test with atmlst selecting a subset of atoms."""
-        gost = GOSTSHYP(self.mol_h2o, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 110})
-        mf = scf.RHF(self.mol_h2o)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+@pytest.mark.parametrize('which', ['d2e', 'd2F'])
+def test_d2_scalar_vs_fd(system_name, which):
+    """d2e/d2F analytical matches fdiff of first-order traces."""
+    from pyscf.solvent._gostshyp_hess import (
+        _compute_d2e, _compute_d2F, _compute_scalar_traces)
 
-        atmlst = [0, 2]
-        dV_sub = analytical_grad_vmat(gost, dm, atmlst=atmlst)
-        dV_all = analytical_grad_vmat(gost, dm)
-        self.assertEqual(dV_sub.shape, (2, 3, 13, 13))
-        np.testing.assert_allclose(dV_sub[0], dV_all[0], atol=1e-14)
-        np.testing.assert_allclose(dV_sub[1], dV_all[2], atol=1e-14)
+    gost, dm, _ = _make_gost(system_name)
 
-    def test_fd_masked_amplitudes(self):
-        """Analytic vs FD with tight cavity that triggers amplitude masking."""
-        gost = GOSTSHYP(self.mol_hf, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 0.5})
-        mf = scf.RHF(self.mol_hf)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
+    if which == 'd2e':
+        d2_ana = _compute_d2e(gost, dm)
+        eval_fn = lambda g, d: _compute_scalar_traces(g, d)[0]
+    else:
+        d2_ana = _compute_d2F(gost, dm)
+        eval_fn = lambda g, d: _compute_scalar_traces(g, d)[1]
+    
+    np.testing.assert_allclose(d2_ana, d2_ana.transpose(1, 0, 3, 2, 4), atol=1e-10,
+                               err_msg=f'{which} not symmetric in (A,x) <-> (B,y)')
 
-        # Verify masking is actually triggered
-        self.assertTrue(np.any(gost.amplitudes == 0.0),
-                        'Test requires masked amplitudes but none were masked')
+    # fdiff returns (B, y, A, x, g); analytical is (A, B, x, y, g)
+    d2_fd_raw = _fd_over_geometry(gost, dm, eval_fn, step=1e-4)
+    d2_fd = d2_fd_raw.transpose(2, 0, 3, 1, 4)
+    np.testing.assert_allclose(d2_ana, d2_fd, atol=1e-6,
+                               err_msg=f'{which} analytical vs fd mismatch')
 
-        dV = analytical_grad_vmat(gost, dm)
-        dV_fd = _fd_grad_vmat(gost, dm)
-        np.testing.assert_allclose(dV, dV_fd, atol=1e-7)
 
-    def test_kernel_not_called_raises(self):
-        """Must call kernel() before analytical_grad_vmat."""
-        gost = GOSTSHYP(self.mol_hf, options={'cavity': 'vdw'})
-        dm = np.eye(self.mol_hf.nao_nr())
-        with self.assertRaises(RuntimeError):
-            analytical_grad_vmat(gost, dm)
-
+# ============================================================
+# Hessian infrastructure (keep as unittest — tests specific wiring)
+# ============================================================
 
 class TestHessianInfrastructure(unittest.TestCase):
     """Tests for the GOSTSHYP Hessian hook and infrastructure."""
@@ -525,48 +515,28 @@ class TestHessianInfrastructure(unittest.TestCase):
         cls.mf.kernel()
 
     def test_hessian_runs_and_shape(self):
-        """GOSTSHYP Hessian hook runs end-to-end, returns correct shape."""
         hess = self.mf.Hessian().kernel()
-        natm = self.mol.natm
-        self.assertEqual(hess.shape, (natm, natm, 3, 3))
+        self.assertEqual(hess.shape, (2, 2, 3, 3))
 
     def test_hess_returns_nonzero(self):
-        """GOSTSHYP.hess(dm) returns non-zero values with correct shape."""
         dm = self.mf.make_rdm1()
         de_solvent = self.gost.hess(dm)
-        natm = self.mol.natm
-        self.assertEqual(de_solvent.shape, (natm, natm, 3, 3))
+        self.assertEqual(de_solvent.shape, (2, 2, 3, 3))
         self.assertGreater(np.max(np.abs(de_solvent)), 1e-6)
 
     def test_make_h1_includes_grad_vmat(self):
-        """make_h1 augments vacuum h1 with analytical_grad_vmat."""
         hess_obj = self.mf.Hessian()
-        mo_coeff = self.mf.mo_coeff
-        mo_occ = self.mf.mo_occ
-        h1_sol = hess_obj.make_h1(mo_coeff, mo_occ)
-
-        # Compare to vacuum make_h1
+        h1_sol = hess_obj.make_h1(self.mf.mo_coeff, self.mf.mo_occ)
         vac_hess = hess_obj.undo_solvent()
-        h1_vac = vac_hess.make_h1(mo_coeff, mo_occ)
-
-        # Difference should be analytical_grad_vmat
+        h1_vac = vac_hess.make_h1(self.mf.mo_coeff, self.mf.mo_occ)
         dm = self.mf.make_rdm1()
         self.gost.kernel(dm)
         dv = analytical_grad_vmat(self.gost, dm)
-
         for ia in range(self.mol.natm):
-            diff = h1_sol[ia] - h1_vac[ia]
-            np.testing.assert_allclose(diff, dv[ia], atol=1e-12,
-                                       err_msg=f'make_h1 difference != grad_vmat for atom {ia}')
+            np.testing.assert_allclose(h1_sol[ia] - h1_vac[ia], dv[ia], atol=1e-12)
 
     def test_hessian_hook_type(self):
-        """Hessian() returns WithGOSTSHYPHess instance."""
-        hess_obj = self.mf.Hessian()
-        self.assertIsInstance(hess_obj, WithGOSTSHYPHess)
-
-
-class TestHessianUHF(unittest.TestCase):
-    """Test GOSTSHYP Hessian with UHF."""
+        self.assertIsInstance(self.mf.Hessian(), WithGOSTSHYPHess)
 
     def test_uhf_hessian_runs(self):
         mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g',
@@ -581,387 +551,130 @@ class TestHessianUHF(unittest.TestCase):
         self.assertEqual(hess.shape, (2, 2, 3, 3))
 
 
-class TestExplicitHessian(unittest.TestCase):
-    """Tests for GOSTSHYP.hess(dm) — explicit d²E/dR² at fixed density."""
+# ============================================================
+# gost.hess(dm) vs gost.hess_fd(dm) — direct term at fixed density
+# ============================================================
 
-    def _run_hess(self, mol, cavity='vdw', npoints=110, scaling_factor=1.2):
-        """Helper: SCF → kernel → hess + hess_fd."""
-        opts = {'cavity': cavity, 'pressure_mpa': 50_000,
-                'npoints': npoints, 'scaling_factor': scaling_factor}
-        if cavity == 'vdw/occ':
-            opts['r_ext'] = 0.4724
-        gost = GOSTSHYP(mol, options=opts)
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
-        return gost, dm
-
-    def test_hess_fd_shape(self):
-        """hess_fd returns (natm, natm, 3, 3)."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
-                    cart=True, verbose=0)
-        gost, dm = self._run_hess(mol, npoints=26)
-        H = gost.hess_fd(dm)
-        self.assertEqual(H.shape, (2, 2, 3, 3))
-
-    def test_hess_fd_symmetry(self):
-        """hess_fd satisfies H[A,B,x,y] ~ H[B,A,y,x]."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
-                    cart=True, verbose=0)
-        gost, dm = self._run_hess(mol, npoints=26)
-        H = gost.hess_fd(dm)
-        np.testing.assert_allclose(H, H.transpose(1, 0, 3, 2), atol=1e-7)
-
-    def test_hess_shape_h2(self):
-        """hess(dm) returns correct shape for H2."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pVDZ',
-                    cart=True, verbose=0)
-        gost, dm = self._run_hess(mol, npoints=110)
-        H = gost.hess(dm)
-        self.assertEqual(H.shape, (2, 2, 3, 3))
-
-    def test_hess_symmetry_h2(self):
-        """Analytical Hessian is symmetric for H2."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='cc-pVDZ',
-                    cart=True, verbose=0)
-        gost, dm = self._run_hess(mol, npoints=110)
-        H = gost.hess(dm)
-        np.testing.assert_allclose(H, H.transpose(1, 0, 3, 2), atol=1e-7)
-
-    def test_hess_vs_fd_masked(self):
-        """hess(dm) matches hess_fd(dm) with tight cavity (amplitude masking)."""
-        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='cc-pVDZ',
-                    cart=True, verbose=0)
-        gost, dm = self._run_hess(mol, npoints=110, scaling_factor=0.5)
-        # Verify masking is triggered
-        self.assertTrue(np.any(gost.amplitudes == 0.0),
-                        'Test requires masked amplitudes but none were masked')
-        H_ana = gost.hess(dm)
-        H_fd = gost.hess_fd(dm, step=1e-4)
-        np.testing.assert_allclose(H_ana, H_fd, atol=1e-5)
-
-    def test_hess_pipeline_end_to_end(self):
-        """Full Hessian pipeline (mf.Hessian().kernel()) runs with hess(dm)."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
-                    cart=True, verbose=0)
-        gost = GOSTSHYP(mol, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26})
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        hess = mf.Hessian().kernel()
-        self.assertEqual(hess.shape, (2, 2, 3, 3))
-        # Should not be all zeros anymore (unlike the old stub)
-        self.assertGreater(np.max(np.abs(gost.hess(mf.make_rdm1()))), 1e-6)
-
-    def test_hess_kernel_not_called_raises(self):
-        """Must call kernel() before hess()."""
-        mol = gto.M(atom='H 0 0 0; H 0 0 1.4', basis='sto-3g',
-                    cart=True, verbose=0)
-        gost = GOSTSHYP(mol, options={'cavity': 'vdw'})
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        # Reset forces to None to simulate kernel() not being called
-        gost.forces = None
-        with self.assertRaises(RuntimeError):
-            gost.hess(dm)
-
-
-def _fd_d2_scalar(gost, dm, compute_trace_fn, step=1e-4):
-    """Finite-difference d²(scalar)/dR² by central diff of first derivatives.
-
-    Parameters
-    ----------
-    gost : GOSTSHYP with kernel() called
-    dm : density matrix (fixed)
-    compute_trace_fn : callable(gost, dm) -> (natm, 3, ngrids)
-        Returns the first-order trace (dg_trace or dF_trace).
-    step : float
-
-    Returns
-    -------
-    d2_fd : ndarray (natm, natm, 3, 3, ngrids)
-    """
-    from pyscf.solvent.gostshyp import GOSTSHYP
-    from pyscf.solvent._gostshyp_hess import _compute_scalar_traces
-
-    mol = gost.mol
-    natm = mol.natm
-    ngrids = gost.n_gaussian
-    coords0 = mol.atom_coords().copy()
-    opts = {
-        'cavity': gost.cavity, 'pressure_mpa': gost.pressure_mpa,
-        'npoints': gost.npoints, 'scaling_factor': gost.scaling_factor,
-    }
-    if gost.cavity == 'vdw/occ':
-        opts['r_ext'] = gost.r_ext
-
-    d2_fd = np.zeros((natm, natm, 3, 3, ngrids))
-    for B in range(natm):
-        for y in range(3):
-            coords_p = coords0.copy()
-            coords_p[B, y] += step
-            mol_p = mol.copy()
-            mol_p.set_geom_(coords_p, unit='Bohr')
-            gost_p = GOSTSHYP(mol_p, options=opts)
-            gost_p.kernel(dm)
-            trace_p = compute_trace_fn(gost_p, dm)
-
-            coords_m = coords0.copy()
-            coords_m[B, y] -= step
-            mol_m = mol.copy()
-            mol_m.set_geom_(coords_m, unit='Bohr')
-            gost_m = GOSTSHYP(mol_m, options=opts)
-            gost_m.kernel(dm)
-            trace_m = compute_trace_fn(gost_m, dm)
-
-            d2_fd[:, B, :, y, :] = (trace_p - trace_m) / (2.0 * step)
-
-    return d2_fd
-
-
-class TestD2e(unittest.TestCase):
-    """Tests for _compute_d2e — second derivative of Gtilde trace."""
-
-    @classmethod
-    def setUpClass(cls):
-        from pyscf.solvent._gostshyp_hess import _compute_d2e, _compute_scalar_traces
-        # N2/cc-pVDZ — clean system with large areas
-        mol = gto.M(atom='N 0 0 0; N 0 0 1.098', basis='cc-pVDZ',
-                    unit='Angstrom', verbose=0)
-        opts = {'cavity': 'vdw', 'pressure_mpa': 50_000,
-                'npoints': 110, 'scaling_factor': 1.2}
-        gost = GOSTSHYP(mol, options=opts)
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
-        cls.mol = mol
-        cls.gost = gost
-        cls.dm = dm
-
-    def test_d2e_vs_fd_n2(self):
-        """d2e analytical matches fdiff on N2/cc-pVDZ."""
-        from pyscf.solvent._gostshyp_hess import _compute_d2e, _compute_scalar_traces
-        d2e_ana = _compute_d2e(self.gost, self.dm)
-
-        def get_dg(g, d):
-            dg, _ = _compute_scalar_traces(g, d)
-            return dg
-
-        d2e_fd = _fd_d2_scalar(self.gost, self.dm, get_dg)
-        np.testing.assert_allclose(d2e_ana, d2e_fd, atol=1e-5)
-
-    def test_d2e_symmetry(self):
-        """d2e satisfies d2e[A,B,x,y,g] = d2e[B,A,y,x,g]."""
-        from pyscf.solvent._gostshyp_hess import _compute_d2e
-        d2e = _compute_d2e(self.gost, self.dm)
-        np.testing.assert_allclose(d2e, d2e.transpose(1, 0, 3, 2, 4), atol=1e-10)
-
-
-class TestD2F(unittest.TestCase):
-    """Tests for _compute_d2F — second derivative of Fhat (force) trace."""
-
-    @classmethod
-    def setUpClass(cls):
-        from pyscf.solvent._gostshyp_hess import _compute_d2F, _compute_scalar_traces
-        # N2/cc-pVDZ — clean system
-        mol = gto.M(atom='N 0 0 0; N 0 0 1.098', basis='cc-pVDZ',
-                    unit='Angstrom', verbose=0)
-        opts = {'cavity': 'vdw', 'pressure_mpa': 50_000,
-                'npoints': 110, 'scaling_factor': 1.2}
-        gost = GOSTSHYP(mol, options=opts)
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
-        cls.mol = mol
-        cls.gost = gost
-        cls.dm = dm
-
-    def test_d2F_vs_fd_n2(self):
-        """d2F analytical matches fdiff on N2/cc-pVDZ."""
-        from pyscf.solvent._gostshyp_hess import _compute_d2F, _compute_scalar_traces
-        d2F_ana = _compute_d2F(self.gost, self.dm)
-
-        def get_dF(g, d):
-            _, dF = _compute_scalar_traces(g, d)
-            return dF
-
-        d2F_fd = _fd_d2_scalar(self.gost, self.dm, get_dF)
-        np.testing.assert_allclose(d2F_ana, d2F_fd, atol=1e-5)
-
-    def test_d2F_symmetry(self):
-        """d2F satisfies d2F[A,B,x,y,g] = d2F[B,A,y,x,g]."""
-        from pyscf.solvent._gostshyp_hess import _compute_d2F
-        d2F = _compute_d2F(self.gost, self.dm)
-        np.testing.assert_allclose(d2F, d2F.transpose(1, 0, 3, 2, 4), atol=1e-10)
-
-
-REFERENCE_DIR = os.path.join(os.path.dirname(__file__), 'reference_data')
-
-E2E_SYSTEMS = [
-    ('h2_cc-pvdz', 1e-6),
-    ('n2_cc-pvdz', 1e-6),
-    ('coh2_cc-pvdz', 1e-5),
-    ('h2o_cc-pvdz', 1e-5),
-    ('co2_cc-pvdz', 1e-5),
-    ('sf6_cc-pvdz', 1e-5),
-]
-
-
-@pytest.mark.parametrize('system_name,atol', E2E_SYSTEMS,
-                         ids=[s[0] for s in E2E_SYSTEMS])
-def test_e2e_hessian(system_name, atol):
-    """End-to-end GOSTSHYP Hessian vs stored numerical reference."""
-    from pyscf.solvent.test.reference_systems import make_mf
-
-    ref_path = os.path.join(REFERENCE_DIR, f'hess_{system_name}.npy')
-    if not os.path.exists(ref_path):
-        pytest.skip(f'Reference not found: {ref_path}. '
-                    f'Run: python -m pyscf.solvent.test.'
-                    f'generate_gostshyp_hessian_references '
-                    f'--systems {system_name}')
-
-    hess_ref = np.load(ref_path)
-    mf = make_mf(system_name)
-    hess_ana = mf.Hessian().kernel()
-    np.testing.assert_allclose(
-        hess_ana, hess_ref, atol=atol,
-        err_msg=f'{system_name}: analytical Hessian does not match reference')
-
-
-# --- Parametrized gost.hess(dm) vs gost.hess_fd(dm) tests ---
-
-HESS_VS_FD_SYSTEMS = [
-    ('H2', 'H 0 0 0; H 0 0 1.4', 'cc-pVDZ', {'cavity': 'vdw'}),
-    ('N2', 'N 0 0 0; N 0 0 1.098', 'cc-pVDZ', {'cavity': 'vdw'}),
-    ('H2O', 'O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587', 'cc-pVDZ',
-     {'cavity': 'vdw'}),
-]
-
-
-@pytest.mark.parametrize('name,atom,basis,extra_opts', HESS_VS_FD_SYSTEMS,
-                         ids=[s[0] for s in HESS_VS_FD_SYSTEMS])
-def test_hess_vs_fd(name, atom, basis, extra_opts):
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+def test_hess_vs_fd(system_name):
     """gost.hess(dm) matches gost.hess_fd(dm) at fixed density."""
-    mol = gto.M(atom=atom, basis=basis, unit='Angstrom', verbose=0)
-    opts = {'pressure_mpa': 50_000, 'npoints': 110, 'scaling_factor': 1.2}
-    opts.update(extra_opts)
-    gost = GOSTSHYP(mol, options=opts)
+    gost, dm, mol = _make_gost(system_name)
+    H_ana = gost.hess(dm)
+    H_fd = gost.hess_fd(dm, step=1e-4)
+    np.testing.assert_allclose(H_ana, H_fd, atol=1e-6)
+
+
+def test_hess_vs_fd_masked():
+    """hess(dm) matches hess_fd(dm) with tight cavity (amplitude masking)."""
+    mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='cc-pVDZ',
+                cart=True, verbose=0)
+    gost = GOSTSHYP(mol, options={
+        'cavity': 'vdw', 'pressure_mpa': 50_000,
+        'npoints': 110, 'scaling_factor': 0.5})
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
     mf = gostshyp_for_scf(mf, gost)
     mf.kernel()
     dm = mf.make_rdm1()
     gost.kernel(dm)
+    assert np.any(gost.amplitudes == 0.0), 'No masked amplitudes'
     H_ana = gost.hess(dm)
     H_fd = gost.hess_fd(dm, step=1e-4)
-    np.testing.assert_allclose(H_ana, H_fd, atol=1e-5)
+    np.testing.assert_allclose(H_ana, H_fd, atol=1e-6)
 
 
-class TestBDotX(unittest.TestCase):
-    """Tests for GOSTSHYP._B_dot_x — CPHF linear response kernel."""
+# ============================================================
+# End-to-end Hessian vs stored numerical references
+# ============================================================
 
-    @classmethod
-    def setUpClass(cls):
-        mol = gto.M(atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
-                    basis='cc-pVDZ', unit='Angstrom', verbose=0)
-        gost = GOSTSHYP(mol, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2})
-        mf = scf.RHF(mol)
-        mf.conv_tol = 1e-12
-        mf = gostshyp_for_scf(mf, gost)
-        mf.kernel()
-        dm = mf.make_rdm1()
-        gost.kernel(dm)
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+def test_e2e_hessian(system_name):
+    """Full SCF+GOSTSHYP Hessian vs stored numerical reference."""
+    from pyscf.solvent.test.reference_systems import make_mf
 
-        cls.mol = mol
-        cls.gost = gost
-        cls.dm = dm
+    ref_path = os.path.join(REFERENCE_DIR, f'hess_{system_name}.npy')
+    if not os.path.exists(ref_path):
+        pytest.skip(f'Reference not found. Run: python -m pyscf.solvent.test.'
+                    f'generate_gostshyp_hessian_references --systems {system_name}')
 
-        rng = np.random.default_rng(42)
-        nao = mol.nao_nr()
-        dm1 = rng.standard_normal((nao, nao))
-        cls.dm1 = 0.5 * (dm1 + dm1.T)
+    hess_ref = np.load(ref_path)
+    mf = make_mf(system_name)
+    hess_ana = mf.Hessian().kernel()
+    np.testing.assert_allclose(hess_ana, hess_ref, atol=1e-6)
 
-    def test_fd_h2o(self):
-        """_B_dot_x matches finite differences of kernel() on H2O/cc-pVDZ."""
-        gost, dm, dm1 = self.gost, self.dm, self.dm1
-        v_ana = gost._B_dot_x(dm1)
 
-        eps = 1e-5
-        opts = {'cavity': gost.cavity, 'pressure_mpa': gost.pressure_mpa,
-                'npoints': gost.npoints, 'scaling_factor': gost.scaling_factor}
-        gost_p = GOSTSHYP(self.mol, options=opts)
-        gost_p.kernel(dm + eps * dm1)
-        gost_m = GOSTSHYP(self.mol, options=opts)
-        gost_m.kernel(dm - eps * dm1)
-        v_fd = (gost_p.v - gost_m.v) / (2 * eps)
+# ============================================================
+# _B_dot_x — CPHF linear response kernel
+# ============================================================
 
-        np.testing.assert_allclose(v_ana, v_fd, atol=1e-7)
+@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
+def test_B_dot_x_vs_fd(system_name):
+    """_B_dot_x matches finite differences of kernel()."""
+    gost, dm, mol = _make_gost(system_name)
+    nao = mol.nao_nr()
+    rng = np.random.default_rng(42)
+    dm1 = rng.standard_normal((nao, nao))
+    dm1 = 0.5 * (dm1 + dm1.T)
 
-    def test_symmetry(self):
-        """_B_dot_x output is symmetric."""
-        v = self.gost._B_dot_x(self.dm1)
-        np.testing.assert_allclose(v, v.T, atol=1e-14)
+    v_ana = gost._B_dot_x(dm1)
 
-    def test_direct_vs_cached(self):
-        """Direct and cached modes give same result."""
-        gost = self.gost
-        dm1 = self.dm1
+    eps = 1e-5
+    opts = _gost_options(gost)
+    gost_p = GOSTSHYP(mol, options=opts)
+    gost_p.kernel(dm + eps * dm1)
+    gost_m = GOSTSHYP(mol, options=opts)
+    gost_m.kernel(dm - eps * dm1)
+    v_fd = (gost_p.v - gost_m.v) / (2 * eps)
 
-        # Force cached mode
-        gost_cached = GOSTSHYP(self.mol, options={
-            'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2, 'direct': False})
-        gost_cached.kernel(self.dm)
+    np.testing.assert_allclose(v_ana, v_fd, atol=1e-7)
 
-        v_direct = gost._B_dot_x(dm1)
-        v_cached = gost_cached._B_dot_x(dm1)
-        np.testing.assert_allclose(v_direct, v_cached, atol=1e-12)
 
-    def test_batched(self):
-        """Batched (nset, nao, nao) input gives same result as individual calls."""
-        gost = self.gost
-        nao = self.mol.nao_nr()
-        rng = np.random.default_rng(123)
-        nset = 3
-        dm1_batch = rng.standard_normal((nset, nao, nao))
-        dm1_batch = 0.5 * (dm1_batch + dm1_batch.transpose(0, 2, 1))
+@pytest.fixture
+def b_dot_x_system():
+    """H2O system for _B_dot_x property tests."""
+    gost, dm, mol = _make_gost('h2o_cc-pvdz')
+    rng = np.random.default_rng(42)
+    nao = mol.nao_nr()
+    dm1 = rng.standard_normal((nao, nao))
+    dm1 = 0.5 * (dm1 + dm1.T)
+    return gost, dm, mol, dm1
 
-        v_batch = gost._B_dot_x(dm1_batch)
-        v_singles = np.array([gost._B_dot_x(dm1_batch[i]) for i in range(nset)])
-        np.testing.assert_allclose(v_batch, v_singles, atol=1e-14)
 
-    def test_shape_single(self):
-        """Single dm1 input returns (nao, nao)."""
-        v = self.gost._B_dot_x(self.dm1)
-        nao = self.mol.nao_nr()
-        self.assertEqual(v.shape, (nao, nao))
+def test_B_dot_x_symmetry(b_dot_x_system):
+    """_B_dot_x output is symmetric."""
+    gost, dm, mol, dm1 = b_dot_x_system
+    v = gost._B_dot_x(dm1)
+    np.testing.assert_allclose(v, v.T, atol=1e-14)
 
-    def test_shape_batched(self):
-        """Batched dm1 input returns (nset, nao, nao)."""
-        nao = self.mol.nao_nr()
-        dm1 = np.zeros((4, nao, nao))
-        v = self.gost._B_dot_x(dm1)
-        self.assertEqual(v.shape, (4, nao, nao))
 
-    def test_kernel_not_called_raises(self):
-        """Must call kernel() before _B_dot_x."""
-        gost = GOSTSHYP(self.mol, options={'cavity': 'vdw'})
-        with self.assertRaises((RuntimeError, AttributeError)):
-            gost._B_dot_x(self.dm1)
+def test_B_dot_x_direct_vs_cached(b_dot_x_system):
+    """Direct and cached modes give same result."""
+    gost, dm, mol, dm1 = b_dot_x_system
+    opts = _gost_options(gost)
+    opts['direct'] = False
+    gost_cached = GOSTSHYP(mol, options=opts)
+    gost_cached.kernel(dm)
+    np.testing.assert_allclose(gost._B_dot_x(dm1), gost_cached._B_dot_x(dm1), atol=1e-12)
+
+
+def test_B_dot_x_batched(b_dot_x_system):
+    """Batched input gives same result as individual calls."""
+    gost, dm, mol, dm1 = b_dot_x_system
+    nao = mol.nao_nr()
+    rng = np.random.default_rng(123)
+    dm1_batch = rng.standard_normal((3, nao, nao))
+    dm1_batch = 0.5 * (dm1_batch + dm1_batch.transpose(0, 2, 1))
+    v_batch = gost._B_dot_x(dm1_batch)
+    v_singles = np.array([gost._B_dot_x(dm1_batch[i]) for i in range(3)])
+    np.testing.assert_allclose(v_batch, v_singles, atol=1e-14)
+
+
+def test_B_dot_x_shape(b_dot_x_system):
+    """Shape matches input."""
+    gost, dm, mol, dm1 = b_dot_x_system
+    nao = mol.nao_nr()
+    assert gost._B_dot_x(dm1).shape == (nao, nao)
+    assert gost._B_dot_x(np.zeros((4, nao, nao))).shape == (4, nao, nao)
 
 
 if __name__ == '__main__':

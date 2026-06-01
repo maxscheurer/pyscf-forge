@@ -9,7 +9,7 @@ To regenerate references, run:
     python -m pyscf.solvent.test.generate_gostshyp_hessian_references --all
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 
 @dataclass(frozen=True)
@@ -23,14 +23,9 @@ class GOSTSHYPOptions:
 
     def to_dict(self):
         """Convert to dict for GOSTSHYP constructor."""
-        d = {
-            'cavity': self.cavity,
-            'pressure_mpa': self.pressure_mpa,
-            'npoints': self.npoints,
-            'scaling_factor': self.scaling_factor,
-        }
-        if self.cavity == 'vdw/occ':
-            d['r_ext'] = self.r_ext
+        d = asdict(self)
+        if self.cavity != 'vdw/occ':
+            d.pop('r_ext')
         return d
 
 
@@ -65,12 +60,9 @@ class ReferenceSystem:
         mf.conv_tol = 1e-12
         mf.conv_tol_grad = 1e-10
         mf.kernel()
-        assert mf.converged, f'SCF did not converge for {self.name}'
+        assert mf.converged, f'SCF did not converge for {self.key}'
         return mf
 
-
-# Default GOSTSHYP options shared by all systems
-_opts = GOSTSHYPOptions()
 
 _SYSTEM_LIST = [
     ReferenceSystem(

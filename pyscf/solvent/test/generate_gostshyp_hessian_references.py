@@ -15,7 +15,6 @@ Without arguments, prints available systems.
 
 import argparse
 import os
-import sys
 import time
 
 import numpy as np
@@ -112,9 +111,7 @@ def main():
         names = args.systems
         for n in names:
             if n not in SYSTEMS:
-                print(f'Unknown system: {n}')
-                print(f'Available: {list(SYSTEMS.keys())}')
-                sys.exit(1)
+                raise KeyError(f'Unknown system: {n}')
     else:
         print('Available systems:')
         for name, system in SYSTEMS.items():
