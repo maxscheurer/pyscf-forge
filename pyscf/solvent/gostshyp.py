@@ -169,6 +169,8 @@ class GOSTSHYP(lib.StreamObject):
         self.e = None
         self.v = None
         self.amplitudes = None
+        self.forces = None
+        self.gtilde_expval = None
 
         self.build()
 
@@ -915,6 +917,13 @@ class GOSTSHYP(lib.StreamObject):
         # Factor for second term of δβ: 2 * P * A_g * e_g / F_g^3
         two_pAe_over_F3 = 2.0 * P * Ag * eg / (Fg ** 3)
 
+        # Masked grid points: alpha is hard-clamped to 0, F frozen at 1.0.
+        # Their derivatives must not contribute to the response.
+        mask = (self.amplitudes == 0.0)
+        if mask.any():
+            pA_over_F2[mask] = 0.0
+            two_pAe_over_F3[mask] = 0.0
+
         vmat = np.zeros((nset, nao, nao))
         for i in range(nset):
             dm1_flat = dm1[i].ravel(order='F')
@@ -946,6 +955,13 @@ class GOSTSHYP(lib.StreamObject):
         # Common factors
         pA_over_F2 = P * Ag / (Fg ** 2)
         two_pAe_over_F3 = 2.0 * P * Ag * eg / (Fg ** 3)
+
+        # Masked grid points: alpha is hard-clamped to 0, F frozen at 1.0.
+        # Their derivatives must not contribute to the response.
+        mask = (self.amplitudes == 0.0)
+        if mask.any():
+            pA_over_F2[mask] = 0.0
+            two_pAe_over_F3[mask] = 0.0
 
         # Chunking (same as _kernel_direct)
         max_memreq = 5 * self.n_gaussian * nao2 * 8.0 / 1e6
