@@ -160,6 +160,17 @@ if __name__ == '__main__':
     test_B_dot_x('N 0 0 0; N 0 0 1.098', 'cc-pVDZ', opts_vdw,
                  'N2/cc-pVDZ/vdw', direct=False)
 
+    # --- SF6/cc-pVDZ ---
+    sf6_atom = '''S  0.000  0.000  0.000
+                  F  1.560  0.000  0.000
+                  F -1.560  0.000  0.000
+                  F  0.000  1.560  0.000
+                  F  0.000 -1.560  0.000
+                  F  0.000  0.000  1.560
+                  F  0.000  0.000 -1.560'''
+    test_B_dot_x(sf6_atom, 'cc-pVDZ', opts_vdw,
+                 'SF6/cc-pVDZ/vdw', direct=True)
+
     # --- Batched test ---
     test_batched('H 0 0 0; H 0 0 0.74', 'sto-3g', opts_vdw,
                  'H2/sto-3g/vdw')

@@ -191,7 +191,7 @@ def test_assembly(gost, dm, mol, use_fd_traces=False):
 
 if __name__ == '__main__':
     print("Setting up H2/sto-3g...")
-    gost, dm, mol = make_h2_system()
+    gost, dm, mol = make_h2_system(cavity="vdw")
     print(f"  {mol.natm} atoms, {gost.n_gaussian} grid points\n")
 
     # First test with fdiff traces to validate the assembly formula

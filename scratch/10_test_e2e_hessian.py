@@ -12,6 +12,7 @@ Just the PySCF API.
 import numpy as np
 from pyscf import gto, scf
 from pyscf.solvent.gostshyp import GOSTSHYP
+from tqdm import tqdm
 
 
 def numerical_hessian(mol, gost_opts, step=1e-4):
@@ -20,7 +21,7 @@ def numerical_hessian(mol, gost_opts, step=1e-4):
     coords0 = mol.atom_coords().copy()
     hess = np.zeros((natm, 3, natm, 3))
 
-    for B in range(natm):
+    for B in tqdm(range(natm), desc="Numerical Hessian"):
         for y in range(3):
             for sign, s in [(+1, step), (-1, -step)]:
                 coords = coords0.copy()
@@ -30,8 +31,10 @@ def numerical_hessian(mol, gost_opts, step=1e-4):
                 gost_d = GOSTSHYP(mol_d, options=gost_opts)
                 mf_d = scf.RHF(mol_d).GOSTSHYP(solvent_obj=gost_d)
                 mf_d.conv_tol = 1e-12
+                mf_d.conv_tol_grad = 1e-10
                 mf_d.verbose = 0
                 mf_d.kernel()
+                assert mf_d.converged, f"SCF failed to converge at displaced geometry for atom {B} coord {y}"
                 grad_d = mf_d.nuc_grad_method()
                 grad_d.verbose = 0
                 g = grad_d.kernel()
@@ -51,7 +54,10 @@ def test_e2e(atom, basis, gost_opts, label):
     gost = GOSTSHYP(mol, options=gost_opts)
     mf = scf.RHF(mol).GOSTSHYP(solvent_obj=gost)
     mf.conv_tol = 1e-12
+    mf.conv_tol_grad = 1e-10
     mf.kernel()
+    assert mf.converged, "SCF failed to converge at initial geometry"
+    assert mf.with_solvent is not None, "GOSTSHYP solvent object not attached to SCF"
 
     gost = mf.with_solvent
     print(f'\n{"="*60}')
@@ -94,8 +100,27 @@ if __name__ == '__main__':
     opts_vdw = {'cavity': 'vdw', 'pressure_mpa': 50_000,
                 'npoints': 110, 'scaling_factor': 1.2}
 
-    test_e2e('H 0 0 0; H 0 0 0.74', 'sto-3g', opts_vdw,
-             'H2/sto-3g/vdw')
+    # test_e2e('H 0 0 0; H 0 0 0.74', 'sto-3g', opts_vdw,
+    #          'H2/sto-3g/vdw')
 
-    test_e2e('N 0 0 0; N 0 0 1.098', 'cc-pVDZ', opts_vdw,
-             'N2/cc-pVDZ/vdw')
+    # test_e2e('N 0 0 0; N 0 0 1.098', 'cc-pVDZ', opts_vdw,
+    #          'N2/cc-pVDZ/vdw')
+
+    # test_e2e('O -1.0 0 0; C 0 0 0; O 1.0 0.1 0', 'cc-pvdz', opts_vdw,
+    #          'CO2/cc-pVDZ/vdw')
+
+    test_e2e('O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587', 'cc-pvdz',
+             opts_vdw, 'H2O/cc-pVDZ/vdw')
+
+    # formaldehyde
+    # test_e2e('C 0 0 0; O 1.2 0 0; H -0.6 0.9 0; H -0.6 -0.9 0', 'cc-pVDZ',
+    #          opts_vdw, 'H2CO/cc-pVDZ/vdw')
+
+    # sf6_atom = '''S  0.000  0.000  0.000
+    #               F  1.560  0.000  0.000
+    #               F -1.560  0.000  0.000
+    #               F  0.000  1.560  0.000
+    #               F  0.000 -1.560  0.000
+    #               F  0.000  0.000  1.560
+    #               F  0.000  0.000 -1.560'''
+    # test_e2e(sf6_atom, 'sto-3g', opts_vdw, 'SF6/cc-pVDZ/vdw')
