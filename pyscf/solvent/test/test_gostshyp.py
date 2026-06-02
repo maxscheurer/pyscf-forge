@@ -306,6 +306,112 @@ class TestReset(unittest.TestCase):
         self.assertTrue(mf.converged)
 
 
+class TestAreaPruning(unittest.TestCase):
+    """Tests for the area_thresh pruning option."""
+
+    def _make_h2o(self, **opts):
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                    basis='sto-3g', unit='Bohr', verbose=0)
+        defaults = {'cavity': 'vdw', 'pressure_mpa': 50_000,
+                    'npoints': 110, 'scaling_factor': 1.2}
+        defaults.update(opts)
+        return GOSTSHYP(mol, options=defaults)
+
+    def test_default_thresh_prunes_small_areas(self):
+        """Default area_thresh=1e-3 removes points with area < 1e-3."""
+        gost = self._make_h2o()
+        self.assertEqual(gost.area_thresh, 1e-3)
+        self.assertTrue(np.all(gost.areas >= 1e-3))
+
+    def test_no_pruning_has_small_areas(self):
+        """With area_thresh=None, small-area points are kept."""
+        gost = self._make_h2o(area_thresh=None)
+        self.assertTrue(np.any(gost.areas < 1e-3))
+
+    def test_fewer_points_after_pruning(self):
+        """Pruning removes grid points."""
+        gost_full = self._make_h2o(area_thresh=None)
+        gost_pruned = self._make_h2o(area_thresh=1e-3)
+        self.assertLess(gost_pruned.n_gaussian, gost_full.n_gaussian)
+
+    def test_zero_thresh_disables_pruning(self):
+        """area_thresh=0 disables pruning (same as None)."""
+        gost_none = self._make_h2o(area_thresh=None)
+        gost_zero = self._make_h2o(area_thresh=0)
+        self.assertEqual(gost_none.n_gaussian, gost_zero.n_gaussian)
+
+    def test_arrays_consistent_after_pruning(self):
+        """All surface arrays have consistent shapes after pruning."""
+        gost = self._make_h2o()
+        n = gost.n_gaussian
+        self.assertEqual(gost.grid_coords.shape, (n, 3))
+        self.assertEqual(gost.areas.shape, (n,))
+        self.assertEqual(gost.atom_idx.shape, (n,))
+        self.assertEqual(gost.widths.shape, (n,))
+        self.assertEqual(gost.surface_normals.shape, (n, 3))
+
+    def test_gslice_by_atom_consistent(self):
+        """gslice_by_atom covers all grid points without gaps."""
+        gost = self._make_h2o()
+        slices = gost.surface_dict['gslice_by_atom']
+        # Should cover [0, n_gaussian) contiguously
+        self.assertEqual(slices[0][0], 0)
+        self.assertEqual(slices[-1][1], gost.n_gaussian)
+        for i in range(len(slices) - 1):
+            self.assertEqual(slices[i][1], slices[i + 1][0])
+
+    def test_vdw_occ_pruning(self):
+        """Pruning works with vdw/occ cavity."""
+        gost = self._make_h2o(cavity='vdw/occ')
+        self.assertTrue(np.all(gost.areas >= 1e-3))
+        # _outer_surface_dict should match in size
+        outer_area = gost._outer_surface_dict['area']
+        self.assertEqual(len(outer_area), gost.n_gaussian)
+
+    def test_energy_negligible_change(self):
+        """Pruning causes negligible self-consistent energy change."""
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                    basis='sto-3g', unit='Bohr', verbose=0)
+
+        gost_full = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': None})
+        mf_full = gostshyp_for_scf(scf.RHF(mol), gost_full)
+        mf_full.conv_tol = 1e-12
+        mf_full.kernel()
+
+        gost_pruned = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': 1e-3})
+        mf_pruned = gostshyp_for_scf(scf.RHF(mol), gost_pruned)
+        mf_pruned.conv_tol = 1e-12
+        mf_pruned.kernel()
+
+        # Energy change should be < 10 µHa
+        self.assertAlmostEqual(mf_full.e_tot, mf_pruned.e_tot, places=4)
+
+    def test_warning_on_large_area_removal(self):
+        """Warning is emitted when >1% of total area is removed."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log',
+                                         delete=False) as f:
+            logfile = f.name
+        try:
+            mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                        basis='sto-3g', unit='Bohr', verbose=4, output=logfile)
+            # Use a very aggressive threshold that removes >1% of area
+            GOSTSHYP(mol, options={
+                'cavity': 'vdw', 'pressure_mpa': 50_000,
+                'npoints': 110, 'scaling_factor': 1.2,
+                'area_thresh': 1e-1})
+            with open(logfile) as f:
+                output = f.read()
+            self.assertIn('WARN', output)
+            self.assertIn('area pruning', output)
+        finally:
+            os.unlink(logfile)
+
+
 # ============================================================
 # Hessian test utilities
 # ============================================================
