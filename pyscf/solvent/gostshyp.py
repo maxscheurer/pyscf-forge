@@ -882,6 +882,7 @@ class GOSTSHYP(lib.StreamObject):
             'pressure_mpa': self.pressure_mpa,
             'npoints': self.npoints,
             'scaling_factor': self.scaling_factor,
+            'area_thresh': self.area_thresh,
         }
         if self.cavity == 'vdw/occ':
             options['r_ext'] = self.r_ext

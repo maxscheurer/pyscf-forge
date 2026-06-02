@@ -427,6 +427,7 @@ def _gost_options(gost):
     opts = {
         'cavity': gost.cavity, 'pressure_mpa': gost.pressure_mpa,
         'npoints': gost.npoints, 'scaling_factor': gost.scaling_factor,
+        'area_thresh': gost.area_thresh,
     }
     if gost.cavity == 'vdw/occ':
         opts['r_ext'] = gost.r_ext

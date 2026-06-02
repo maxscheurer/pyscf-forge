@@ -102,6 +102,12 @@ _SYSTEM_LIST = [
               'F  0.000  0.000 -1.560'),
         basis='cc-pVDZ',
     ),
+    ReferenceSystem(
+        molecule='H2O-occ',
+        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+        basis='cc-pVDZ',
+        gostshyp=GOSTSHYPOptions(cavity='vdw/occ'),
+    ),
 ]
 
 SYSTEMS = {s.key: s for s in _SYSTEM_LIST}

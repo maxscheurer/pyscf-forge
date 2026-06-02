@@ -31,6 +31,7 @@ Each of d²e and d²F decomposes into 5 groups:
 
 import numpy as np
 
+from pyscf import lib
 from pyscf.solvent.gostshyp import fakemol_for_gaussian
 from pyscf.solvent.grad.pcm import get_dF_dA
 from pyscf.solvent.hessian.pcm import get_d2F_d2A
@@ -122,7 +123,16 @@ def kernel(gost, dm):
     hess += 2.0 * P * np.einsum('g,g,g,Axg,Byg->ABxy', A_g, e_g, inv_F3,
                                 dF_trace, dF_trace, optimize=True)
 
-    return 0.5 * (hess + hess.transpose(1, 0, 3, 2))
+    hess = 0.5 * (hess + hess.transpose(1, 0, 3, 2))
+
+    if not np.isfinite(hess).all():
+        log = lib.logger.new_logger(gost)
+        log.warn('GOSTSHYP Hessian contains non-finite values. '
+                 'This typically occurs when area_thresh is disabled '
+                 '(None/0) and the surface has very small-area grid points. '
+                 'Consider setting area_thresh > 0.')
+
+    return hess
 
 
 # ---------------------------------------------------------------------------
