@@ -31,6 +31,7 @@ Each of d²e and d²F decomposes into 5 groups:
 
 import numpy as np
 
+from pyscf import lib
 from pyscf.solvent.gostshyp import fakemol_for_gaussian
 from pyscf.solvent.grad.pcm import get_dF_dA
 from pyscf.solvent.hessian.pcm import get_d2F_d2A
@@ -55,6 +56,11 @@ def kernel(gost, dm):
     F_g = gost.forces
     A_g = gost.areas
 
+    # Inactive grid points: negative amplitudes clamped to zero in
+    # gostshyp.kernel(), forces set to sentinel 1.0.  These must not
+    # contribute to the Hessian.
+    inactive = (gost.amplitudes == 0.0)
+
     # First derivatives of e_g and F_g
     dg_trace, dF_trace = _compute_scalar_traces(gost, dm)
 
@@ -77,6 +83,15 @@ def kernel(gost, dm):
     inv_F = 1.0 / F_g
     inv_F2 = inv_F ** 2
     inv_F3 = inv_F ** 3
+
+    # Zero out assembly prefactors for inactive grid points so they
+    # contribute nothing to the Hessian sum.
+    if inactive.any():
+        e_g = e_g.copy()
+        e_g[inactive] = 0.0
+        inv_F[inactive] = 0.0
+        inv_F2[inactive] = 0.0
+        inv_F3[inactive] = 0.0
 
     hess = np.zeros((natm, natm, 3, 3))
     # H1: d²A · e/F
@@ -108,7 +123,16 @@ def kernel(gost, dm):
     hess += 2.0 * P * np.einsum('g,g,g,Axg,Byg->ABxy', A_g, e_g, inv_F3,
                                 dF_trace, dF_trace, optimize=True)
 
-    return 0.5 * (hess + hess.transpose(1, 0, 3, 2))
+    hess = 0.5 * (hess + hess.transpose(1, 0, 3, 2))
+
+    if not np.isfinite(hess).all():
+        log = lib.logger.new_logger(gost)
+        log.warn('GOSTSHYP Hessian contains non-finite values. '
+                 'This typically occurs when area_thresh is disabled '
+                 '(None/0) and the surface has very small-area grid points. '
+                 'Consider setting area_thresh > 0.')
+
+    return hess
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +454,7 @@ def _compute_d2e(gost, dm):
 # d²F_g/(dR_Ax dR_By) — second derivative of Fhat (force) trace
 # ---------------------------------------------------------------------------
 
-def _compute_d2F(gost, dm, force_thresh=1e-9):
+def _compute_d2F(gost, dm):
     """Compute d²F_g/(dR_Ax dR_By) analytically.
 
     Returns shape (natm, natm, 3, 3, ngrids).
@@ -460,9 +484,6 @@ def _compute_d2F(gost, dm, force_thresh=1e-9):
         _, dareas_raw = get_dF_dA(gost.surface_dict)
         dareas = dareas_raw.transpose(1, 2, 0)
         _, d2A = get_d2F_d2A(gost.surface_dict)
-
-    # Conditioning guard for width-response terms
-    stable = forces > force_thresh
 
     d2F = np.zeros((natm, natm, 3, 3, ngrids))
 
@@ -626,7 +647,6 @@ def _compute_d2F(gost, dm, force_thresh=1e-9):
 
     # Combined cross-term scalar
     d_dFhat_domega_dm_pos = dF_pos / widths + d_f_dm_pos
-    d_dFhat_domega_dm_pos[:, :, ~stable] = 0.0
 
     # G2 + G3
     d2F += np.einsum('g,Byg,Axg->ABxyg', wgrad_prefs, dareas,
@@ -652,7 +672,6 @@ def _compute_d2F(gost, dm, force_thresh=1e-9):
     del overlap3f, fx, fy, fz
 
     dFhat_domega_trace = forces / widths + f_contracted_dm
-    dFhat_domega_trace[~stable] = 0.0
 
     # G4a: (-2·wgp/A · dA_Ax · dA_By) · dFhat_domega_trace
     d2F += np.einsum('g,Axg,Byg,g->ABxyg',
@@ -692,7 +711,6 @@ def _compute_d2F(gost, dm, force_thresh=1e-9):
     del overlap3h, h5x, h5y, h5z
 
     d2Fhat_domega2_trace = 2.0 * f_contracted_dm / widths + h5_dm
-    d2Fhat_domega2_trace[~stable] = 0.0
 
     d2F += np.einsum('g,Axg,g,Byg,g->ABxyg',
                      wgrad_prefs, dareas, wgrad_prefs, dareas,

@@ -19,6 +19,7 @@ class GOSTSHYPOptions:
     pressure_mpa: float = 50_000
     npoints: int = 110
     scaling_factor: float = 1.2
+    area_thresh: float = 1e-3
     r_ext: float = 0.4724  # only used for vdw/occ
 
     def to_dict(self):
@@ -100,6 +101,12 @@ _SYSTEM_LIST = [
               'F  0.000  0.000  1.560; '
               'F  0.000  0.000 -1.560'),
         basis='cc-pVDZ',
+    ),
+    ReferenceSystem(
+        molecule='H2O-occ',
+        atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+        basis='cc-pVDZ',
+        gostshyp=GOSTSHYPOptions(cavity='vdw/occ'),
     ),
 ]
 

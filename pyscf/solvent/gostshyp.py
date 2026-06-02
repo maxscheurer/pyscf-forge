@@ -147,6 +147,11 @@ class GOSTSHYP(lib.StreamObject):
         Extension radius for vdW/OCC in Bohr (default: 0.4724 ~ 0.25 Ang).
     direct : bool
         If True, compute integrals on-the-fly without caching (default: True).
+    area_thresh : float or None
+        Grid points with area below this threshold (Bohr²) are pruned from
+        the surface.  This removes numerically problematic small-area points
+        that cause ill-conditioning in the Hessian (width ∝ 1/area²).
+        Set to 0 or None to disable pruning (default: 1e-3).
     """
 
     def __init__(self, mol, options=None):
@@ -163,6 +168,7 @@ class GOSTSHYP(lib.StreamObject):
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)  # Bohr (0.25 Ang)
         self.direct = options.get('direct', True)
+        self.area_thresh = options.get('area_thresh', 1e-3)
 
         self.frozen = False
         self.equilibrium_solvation = False
@@ -225,6 +231,10 @@ class GOSTSHYP(lib.StreamObject):
             raise ValueError(
                 'Non-positive surface areas detected; cavity is degenerate.')
         self.atom_idx = atom_idx
+
+        # Prune small-area points before computing derived quantities
+        self._prune_small_areas()
+
         self.widths = np.pi * np.log(2) / self.areas
         self.n_gaussian = len(self.areas)
         self.surface_normals = compute_surface_normals(
@@ -238,6 +248,82 @@ class GOSTSHYP(lib.StreamObject):
                     self.n_gaussian, self.cavity)
         return self
 
+    def _prune_small_areas(self):
+        """Remove grid points with area below area_thresh from the surface.
+
+        This eliminates numerically problematic points where the Gaussian
+        width (∝ 1/area) becomes excessively large, causing ill-conditioning
+        in derivative computations.  The removed points carry negligible
+        surface area and energy (<µHa for typical thresholds).
+        """
+        if not self.area_thresh:
+            return
+
+        keep = self.areas >= self.area_thresh
+        n_removed = int(np.sum(~keep))
+        if n_removed == 0:
+            return
+
+        total_area = np.sum(self.areas)
+        area_removed_frac = np.sum(self.areas[~keep]) / total_area
+
+        if area_removed_frac > 0.01:
+            logger.warn(self,
+                'GOSTSHYP: area pruning removed %.1f%% of total surface area '
+                '(%d/%d points, thresh=%.1e). Consider reducing area_thresh '
+                'or inspecting the cavity.',
+                100.0 * area_removed_frac, n_removed, len(self.areas),
+                self.area_thresh)
+
+        logger.info(self, 'GOSTSHYP: pruned %d/%d points (%.2e%% of area) '
+                    'with area < %.1e',
+                    n_removed, len(self.areas),
+                    100.0 * area_removed_frac, self.area_thresh)
+
+        # Apply mask to surface arrays
+        self.grid_coords = self.grid_coords[keep]
+        self.areas = self.areas[keep]
+        self.atom_idx = self.atom_idx[keep]
+
+        # Update surface_dict entries used by gradient/Hessian
+        self.surface_dict['grid_coords'] = self.grid_coords
+        self.surface_dict['area'] = self.areas
+        if 'grid_coords_outer' in self.surface_dict:
+            self.surface_dict['grid_coords_outer'] = (
+                self.surface_dict['grid_coords_outer'][keep])
+        if 'norm_vec' in self.surface_dict:
+            self.surface_dict['norm_vec'] = self.surface_dict['norm_vec'][keep]
+        if 'R_vdw' in self.surface_dict:
+            self.surface_dict['R_vdw'] = self.surface_dict['R_vdw'][keep]
+
+        # Rebuild gslice_by_atom from filtered atom_idx
+        natm = self.mol.natm
+        new_slices = []
+        pos = 0
+        for i in range(natm):
+            count = int(np.sum(self.atom_idx == i))
+            new_slices.append((pos, pos + count))
+            pos += count
+        self.surface_dict['gslice_by_atom'] = new_slices
+
+        # Update occ-specific arrays if present
+        if self._occ_ratio_sq is not None:
+            self._occ_ratio_sq = self._occ_ratio_sq[keep]
+
+        # Prune _outer_surface_dict (used in gradient for vdw/occ)
+        if self._outer_surface_dict is not None:
+            self._outer_surface_dict['grid_coords'] = (
+                self._outer_surface_dict['grid_coords'][keep])
+            self._outer_surface_dict['area'] = (
+                self._outer_surface_dict['area'][keep])
+            if 'norm_vec' in self._outer_surface_dict:
+                self._outer_surface_dict['norm_vec'] = (
+                    self._outer_surface_dict['norm_vec'][keep])
+            if 'R_vdw' in self._outer_surface_dict:
+                self._outer_surface_dict['R_vdw'] = (
+                    self._outer_surface_dict['R_vdw'][keep])
+            self._outer_surface_dict['gslice_by_atom'] = new_slices
+
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)
         logger.info(self, 'pressure = %.1f MPa (%.6e a.u.)',
@@ -248,6 +334,7 @@ class GOSTSHYP(lib.StreamObject):
         if self.cavity == 'vdw/occ':
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
         logger.info(self, 'direct = %s', self.direct)
+        logger.info(self, 'area_thresh = %s', self.area_thresh)
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
         return self
 
@@ -795,6 +882,7 @@ class GOSTSHYP(lib.StreamObject):
             'pressure_mpa': self.pressure_mpa,
             'npoints': self.npoints,
             'scaling_factor': self.scaling_factor,
+            'area_thresh': self.area_thresh,
         }
         if self.cavity == 'vdw/occ':
             options['r_ext'] = self.r_ext

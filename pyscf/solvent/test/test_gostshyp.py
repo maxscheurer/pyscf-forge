@@ -35,7 +35,7 @@ class TestGOSTSHYP_VDW(unittest.TestCase):
         cls.mol = make_hf_mol()
         cls.gost = GOSTSHYP(cls.mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2})
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': None})
         cls.mf = scf.RHF(cls.mol)
         cls.mf.conv_tol = 1e-12
         cls.mf.conv_tol_grad = 1e-8
@@ -71,7 +71,7 @@ class TestGOSTSHYP_VDW(unittest.TestCase):
 
         gost_direct = GOSTSHYP(self.mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2, 'direct': True})
+            'npoints': 110, 'scaling_factor': 1.2, 'direct': True, 'area_thresh': None})
         e_direct, f_direct = gost_direct.kernel(dm)
 
         np.testing.assert_allclose(e_direct, e_cached, atol=1e-12)
@@ -163,7 +163,7 @@ class TestDirectGradient(unittest.TestCase):
         mol = make_hf_mol()
         gost = GOSTSHYP(mol, options={
             'cavity': 'vdw', 'pressure_mpa': 50_000,
-            'npoints': 110, 'scaling_factor': 1.2, 'direct': True})
+            'npoints': 110, 'scaling_factor': 1.2, 'direct': True, 'area_thresh': None})
         mf = scf.RHF(mol)
         mf.conv_tol = 1e-12
         mf = gostshyp_for_scf(mf, gost)
@@ -219,7 +219,7 @@ class TestFiniteDifferenceOCC(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -235,7 +235,7 @@ class TestSphericalHarmonics(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -252,7 +252,7 @@ class TestMultiAtom(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -283,7 +283,7 @@ class TestNegativeAmplitudeMasking(unittest.TestCase):
         mf = gostshyp_for_scf(mf, gost)
         mf.kernel()
         analytic = mf.Gradients().kernel()
-        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        fd_grad = finite_diff.kernel(mf, displacement=1e-4)
         np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
 
 
@@ -306,6 +306,112 @@ class TestReset(unittest.TestCase):
         self.assertTrue(mf.converged)
 
 
+class TestAreaPruning(unittest.TestCase):
+    """Tests for the area_thresh pruning option."""
+
+    def _make_h2o(self, **opts):
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                    basis='sto-3g', unit='Bohr', verbose=0)
+        defaults = {'cavity': 'vdw', 'pressure_mpa': 50_000,
+                    'npoints': 110, 'scaling_factor': 1.2}
+        defaults.update(opts)
+        return GOSTSHYP(mol, options=defaults)
+
+    def test_default_thresh_prunes_small_areas(self):
+        """Default area_thresh=1e-3 removes points with area < 1e-3."""
+        gost = self._make_h2o()
+        self.assertEqual(gost.area_thresh, 1e-3)
+        self.assertTrue(np.all(gost.areas >= 1e-3))
+
+    def test_no_pruning_has_small_areas(self):
+        """With area_thresh=None, small-area points are kept."""
+        gost = self._make_h2o(area_thresh=None)
+        self.assertTrue(np.any(gost.areas < 1e-3))
+
+    def test_fewer_points_after_pruning(self):
+        """Pruning removes grid points."""
+        gost_full = self._make_h2o(area_thresh=None)
+        gost_pruned = self._make_h2o(area_thresh=1e-3)
+        self.assertLess(gost_pruned.n_gaussian, gost_full.n_gaussian)
+
+    def test_zero_thresh_disables_pruning(self):
+        """area_thresh=0 disables pruning (same as None)."""
+        gost_none = self._make_h2o(area_thresh=None)
+        gost_zero = self._make_h2o(area_thresh=0)
+        self.assertEqual(gost_none.n_gaussian, gost_zero.n_gaussian)
+
+    def test_arrays_consistent_after_pruning(self):
+        """All surface arrays have consistent shapes after pruning."""
+        gost = self._make_h2o()
+        n = gost.n_gaussian
+        self.assertEqual(gost.grid_coords.shape, (n, 3))
+        self.assertEqual(gost.areas.shape, (n,))
+        self.assertEqual(gost.atom_idx.shape, (n,))
+        self.assertEqual(gost.widths.shape, (n,))
+        self.assertEqual(gost.surface_normals.shape, (n, 3))
+
+    def test_gslice_by_atom_consistent(self):
+        """gslice_by_atom covers all grid points without gaps."""
+        gost = self._make_h2o()
+        slices = gost.surface_dict['gslice_by_atom']
+        # Should cover [0, n_gaussian) contiguously
+        self.assertEqual(slices[0][0], 0)
+        self.assertEqual(slices[-1][1], gost.n_gaussian)
+        for i in range(len(slices) - 1):
+            self.assertEqual(slices[i][1], slices[i + 1][0])
+
+    def test_vdw_occ_pruning(self):
+        """Pruning works with vdw/occ cavity."""
+        gost = self._make_h2o(cavity='vdw/occ')
+        self.assertTrue(np.all(gost.areas >= 1e-3))
+        # _outer_surface_dict should match in size
+        outer_area = gost._outer_surface_dict['area']
+        self.assertEqual(len(outer_area), gost.n_gaussian)
+
+    def test_energy_negligible_change(self):
+        """Pruning causes negligible self-consistent energy change."""
+        mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                    basis='sto-3g', unit='Bohr', verbose=0)
+
+        gost_full = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': None})
+        mf_full = gostshyp_for_scf(scf.RHF(mol), gost_full)
+        mf_full.conv_tol = 1e-12
+        mf_full.kernel()
+
+        gost_pruned = GOSTSHYP(mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000,
+            'npoints': 110, 'scaling_factor': 1.2, 'area_thresh': 1e-3})
+        mf_pruned = gostshyp_for_scf(scf.RHF(mol), gost_pruned)
+        mf_pruned.conv_tol = 1e-12
+        mf_pruned.kernel()
+
+        # Energy change should be < 10 µHa
+        self.assertAlmostEqual(mf_full.e_tot, mf_pruned.e_tot, places=4)
+
+    def test_warning_on_large_area_removal(self):
+        """Warning is emitted when >1% of total area is removed."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log',
+                                         delete=False) as f:
+            logfile = f.name
+        try:
+            mol = gto.M(atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+                        basis='sto-3g', unit='Bohr', verbose=4, output=logfile)
+            # Use a very aggressive threshold that removes >1% of area
+            GOSTSHYP(mol, options={
+                'cavity': 'vdw', 'pressure_mpa': 50_000,
+                'npoints': 110, 'scaling_factor': 1.2,
+                'area_thresh': 1e-1})
+            with open(logfile) as f:
+                output = f.read()
+            self.assertIn('WARN', output)
+            self.assertIn('area pruning', output)
+        finally:
+            os.unlink(logfile)
+
+
 # ============================================================
 # Hessian test utilities
 # ============================================================
@@ -321,6 +427,7 @@ def _gost_options(gost):
     opts = {
         'cavity': gost.cavity, 'pressure_mpa': gost.pressure_mpa,
         'npoints': gost.npoints, 'scaling_factor': gost.scaling_factor,
+        'area_thresh': gost.area_thresh,
     }
     if gost.cavity == 'vdw/occ':
         opts['r_ext'] = gost.r_ext
@@ -406,19 +513,11 @@ def test_grad_vmat_vs_fd(system_name):
     gost, dm, mol = _make_gost(system_name)
     dV_ana = analytical_grad_vmat(gost, dm)
     dV_fd = _fd_over_geometry(gost, dm, lambda g, d: g.v)
+    np.testing.assert_allclose(
+        dV_ana, dV_ana.transpose(0, 1, 3, 2), atol=1e-14,
+        err_msg=f'dV not symmetric'
+    )
     np.testing.assert_allclose(dV_ana, dV_fd, atol=1e-7)
-
-
-@pytest.mark.parametrize('system_name', SYSTEM_NAMES)
-def test_grad_vmat_symmetry(system_name):
-    """Each dV[ia, x] slice is symmetric."""
-    gost, dm, mol = _make_gost(system_name)
-    dV = analytical_grad_vmat(gost, dm)
-    for ia in range(mol.natm):
-        for x in range(3):
-            np.testing.assert_allclose(
-                dV[ia, x], dV[ia, x].T, atol=1e-14,
-                err_msg=f'dV[{ia},{x}] not symmetric')
 
 
 def test_grad_vmat_atmlst_subset():
@@ -453,7 +552,7 @@ def test_grad_vmat_masked_amplitudes():
     mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=True, verbose=0)
     gost = GOSTSHYP(mol, options={
         'cavity': 'vdw', 'pressure_mpa': 50_000,
-        'npoints': 110, 'scaling_factor': 0.5})
+        'npoints': 110, 'scaling_factor': 0.5, 'area_thresh': None})
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
     mf = gostshyp_for_scf(mf, gost)
@@ -570,7 +669,7 @@ def test_hess_vs_fd_masked():
                 cart=True, verbose=0)
     gost = GOSTSHYP(mol, options={
         'cavity': 'vdw', 'pressure_mpa': 50_000,
-        'npoints': 110, 'scaling_factor': 0.5})
+        'npoints': 110, 'scaling_factor': 0.5, 'area_thresh': None})
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
     mf = gostshyp_for_scf(mf, gost)
