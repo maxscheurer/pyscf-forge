@@ -222,6 +222,7 @@ class GOSTSHYP(lib.StreamObject):
                 'Non-positive surface areas detected; cavity is degenerate.')
         self.atom_idx = atom_idx
         self.widths = np.pi * np.log(2) / self.areas
+        self.N_j = (self.widths / np.pi) ** 1.5  # Gaussian normalization
         self.n_gaussian = len(self.areas)
         self.surface_normals = compute_surface_normals(
             mol.atom_coords(), self.grid_coords, self.atom_idx)
@@ -324,9 +325,10 @@ class GOSTSHYP(lib.StreamObject):
         shells = np.arange(self.n_gaussian)
         chunks = np.array_split(shells, n_chunks)
 
-        gmol = fakemol_for_gaussian(self.grid_coords, self.widths)
+        gmol = fakemol_for_gaussian(self.grid_coords, self.widths, coeffs=self.N_j)
         gmol_p = fakemol_for_gaussian(
-            self.grid_coords, self.widths, l=1, coeffs=2.0 * self.widths)
+            self.grid_coords, self.widths, l=1,
+            coeffs=2.0 * self.widths * self.N_j)
         supermol = mol + gmol
         supermol_p = mol + gmol_p
 
@@ -386,7 +388,7 @@ class GOSTSHYP(lib.StreamObject):
     def gtilde(self):
         """s-type 3-center overlap integrals [nao, nao, n_gaussian]."""
         mol = self.mol
-        gmol = fakemol_for_gaussian(self.grid_coords, self.widths)
+        gmol = fakemol_for_gaussian(self.grid_coords, self.widths, coeffs=self.N_j)
         supermol = mol + gmol
         slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
         ret = supermol.intor('int3c1e', shls_slice=slices, aosym='s1')
@@ -398,7 +400,8 @@ class GOSTSHYP(lib.StreamObject):
         mol = self.mol
         nao = mol.nao_nr()
         gmol_p = fakemol_for_gaussian(
-            self.grid_coords, self.widths, l=1, coeffs=2.0 * self.widths)
+            self.grid_coords, self.widths, l=1,
+            coeffs=2.0 * self.widths * self.N_j)
         supermol = mol + gmol_p
         slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p.nbas)
         overlap3 = supermol.intor(
@@ -452,7 +455,7 @@ class GOSTSHYP(lib.StreamObject):
             'acg,g->ac', dareas, gtilde_expval / forces, optimize=True)
 
         # Term 2: gtilde operator derivative
-        gmol = fakemol_for_gaussian(self.grid_coords, self.widths)
+        gmol = fakemol_for_gaussian(self.grid_coords, self.widths, coeffs=self.N_j)
         supermol = mol + gmol
         slices = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
 
@@ -478,7 +481,7 @@ class GOSTSHYP(lib.StreamObject):
         wgrad_prefs = -np.pi * np.log(2) / (self.areas ** 2)
         gmol_d = fakemol_for_gaussian(
             self.grid_coords, self.widths, l=2,
-            coeffs=wgrad_prefs * self.amplitudes)
+            coeffs=wgrad_prefs * self.amplitudes * self.N_j)
         supermol_d = mol + gmol_d
         supermol_d.cart = True
         slices_d = (0, mol.nbas, 0, mol.nbas,
@@ -504,7 +507,7 @@ class GOSTSHYP(lib.StreamObject):
             -2.0 * self.pressure_au * self.areas * gtilde_expval
             * self.widths / (forces * forces))
         gmol_f = fakemol_for_gaussian(
-            self.grid_coords, self.widths, l=1, coeffs=coeffs_fop)
+            self.grid_coords, self.widths, l=1, coeffs=coeffs_fop * self.N_j)
         supermol_f = mol + gmol_f
         slices_f = (0, mol.nbas, 0, mol.nbas,
                     mol.nbas, mol.nbas + gmol_f.nbas)
@@ -532,7 +535,7 @@ class GOSTSHYP(lib.StreamObject):
         # f-orbital width gradient for force operators
         coeffs_f2 = -2.0 * self.widths * wgrad_prefs
         gmol_ft = fakemol_for_gaussian(
-            self.grid_coords, self.widths, l=3, coeffs=coeffs_f2)
+            self.grid_coords, self.widths, l=3, coeffs=coeffs_f2 * self.N_j)
         supermol_ft = mol + gmol_ft
         supermol_ft.cart = True
         slices_ft = (0, mol.nbas, 0, mol.nbas,
@@ -616,6 +619,7 @@ class GOSTSHYP(lib.StreamObject):
             # --- Build chunk-local fakemols ---
             coords_c = self.grid_coords[chunk_idx]
             widths_c = self.widths[chunk_idx]
+            N_j_c = self.N_j[chunk_idx]
             areas_c = self.areas[chunk_idx]
             normals_c = self.surface_normals[chunk_idx]
             amplitudes_c = amplitudes[chunk_idx]
@@ -627,7 +631,7 @@ class GOSTSHYP(lib.StreamObject):
 
             # --- Term 2: gtilde operator derivative ---
             # s-type ip1 bra/ket
-            gmol_s = fakemol_for_gaussian(coords_c, widths_c)
+            gmol_s = fakemol_for_gaussian(coords_c, widths_c, coeffs=N_j_c)
             supermol_s = mol + gmol_s
             slices_s = (0, mol.nbas, 0, mol.nbas,
                         mol.nbas, mol.nbas + gmol_s.nbas)
@@ -659,7 +663,7 @@ class GOSTSHYP(lib.StreamObject):
             # d-type width gradient
             gmol_d = fakemol_for_gaussian(
                 coords_c, widths_c, l=2,
-                coeffs=wgrad_prefs_c * amplitudes_c)
+                coeffs=wgrad_prefs_c * amplitudes_c * N_j_c)
             supermol_d = mol + gmol_d
             supermol_d.cart = True
             slices_d = (0, mol.nbas, 0, mol.nbas,
@@ -685,7 +689,7 @@ class GOSTSHYP(lib.StreamObject):
 
             # p-type ip1 bra/ket
             gmol_f = fakemol_for_gaussian(
-                coords_c, widths_c, l=1, coeffs=coeffs_fop_c)
+                coords_c, widths_c, l=1, coeffs=coeffs_fop_c * N_j_c)
             supermol_f = mol + gmol_f
             slices_f = (0, mol.nbas, 0, mol.nbas,
                         mol.nbas, mol.nbas + gmol_f.nbas)
@@ -721,7 +725,7 @@ class GOSTSHYP(lib.StreamObject):
             # f-type width gradient for force operators
             coeffs_f2_c = -2.0 * widths_c * wgrad_prefs_c
             gmol_ft = fakemol_for_gaussian(
-                coords_c, widths_c, l=3, coeffs=coeffs_f2_c)
+                coords_c, widths_c, l=3, coeffs=coeffs_f2_c * N_j_c)
             supermol_ft = mol + gmol_ft
             supermol_ft.cart = True
             slices_ft = (0, mol.nbas, 0, mol.nbas,
