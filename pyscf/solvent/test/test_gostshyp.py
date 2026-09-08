@@ -301,5 +301,114 @@ class TestReset(unittest.TestCase):
         self.assertTrue(mf.converged)
 
 
+try:
+    from pyscf.solvent.moist import HAS_MOIST
+except ImportError:
+    HAS_MOIST = False
+
+
+@unittest.skipUnless(HAS_MOIST, 'MOIST library not available')
+class TestDROPCavity(unittest.TestCase):
+    """Tests for MOIST DROPSvdW cavity construction."""
+
+    def test_cavity_sanity(self):
+        """DROP cavity produces valid surface data."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={'cavity': 'drop', 'pressure_mpa': 50_000,
+                                       'npoints': 26})
+        self.assertGreater(gost.n_gaussian, 0)
+        self.assertTrue(np.all(gost.areas > 0))
+        norms = np.linalg.norm(gost.surface_normals, axis=1)
+        np.testing.assert_allclose(norms, 1.0, atol=1e-14)
+        self.assertTrue(np.all(gost.atom_idx >= 0))
+        self.assertTrue(np.all(gost.atom_idx < mol.natm))
+
+    def test_drop_scf_converges(self):
+        """SCF with DROP cavity converges."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={'cavity': 'drop', 'pressure_mpa': 50_000,
+                                       'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        self.assertTrue(mf.converged)
+
+    def test_drop_fock_symmetry(self):
+        """DROP Fock contribution is symmetric."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={'cavity': 'drop', 'pressure_mpa': 50_000,
+                                       'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        _, fock = gost.kernel(dm)
+        np.testing.assert_allclose(fock, fock.T, atol=1e-12)
+
+
+@unittest.skipUnless(HAS_MOIST, 'MOIST library not available')
+class TestDROPGradient(unittest.TestCase):
+    """Gradient tests for DROP cavity."""
+
+    def test_gradient_finite_difference(self):
+        """DROP analytic gradient vs finite_diff (HF molecule)."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'drop', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+    def test_gradient_finite_difference_water(self):
+        """DROP analytic gradient vs finite_diff (water)."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587',
+                    basis='sto-3g', cart=True, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'drop', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+    def test_gradient_spherical_basis(self):
+        """DROP gradient with spherical harmonic basis."""
+        from pyscf.tools import finite_diff
+        mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='6-31g', cart=False, verbose=0)
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'drop', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        analytic = mf.Gradients().kernel()
+        fd_grad = finite_diff.kernel(mf, displacement=1e-3)
+        np.testing.assert_allclose(analytic, fd_grad, atol=1e-5)
+
+    def test_gradient_translational_invariance(self):
+        """DROP gradient sums to zero over atoms."""
+        mol = make_hf_mol()
+        gost = GOSTSHYP(mol, options={
+            'cavity': 'drop', 'pressure_mpa': 50_000, 'npoints': 26})
+        mf = scf.RHF(mol)
+        mf.conv_tol = 1e-12
+        mf = gostshyp_for_scf(mf, gost)
+        mf.kernel()
+        dm = mf.make_rdm1()
+        gost.kernel(dm)
+        grad = gost.grad(dm)
+        np.testing.assert_allclose(grad.sum(axis=0), 0.0, atol=1e-8)
+
+
 if __name__ == '__main__':
     unittest.main()
