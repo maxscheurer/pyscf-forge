@@ -513,7 +513,8 @@ class GOSTSHYP(lib.StreamObject):
                 dareas = dareas.transpose(1, 2, 0)
             return dareas, None, None
 
-    def _scatter_gaussian_center_grad(self, per_grid_grad, dcoords, grad_accum):
+    def _scatter_gaussian_center_grad(self, per_grid_grad, dcoords, grad_accum,
+                                      atom_idx=None):
         """Scatter Gaussian-center derivatives to atoms.
 
         For gen_surface, each grid point moves rigidly with its owning atom.
@@ -527,9 +528,14 @@ class GOSTSHYP(lib.StreamObject):
             Position derivatives.  None => rigid scatter to atom_idx.
         grad_accum : ndarray of shape (natm, 3)
             Gradient accumulator (modified in-place).
+        atom_idx : ndarray of shape (ngrid,) or None
+            Atom indices for scatter.  Defaults to self.atom_idx.
+            Must match per_grid_grad when using chunked evaluation.
         """
         if dcoords is None:
-            np.add.at(grad_accum, self.atom_idx, per_grid_grad)
+            if atom_idx is None:
+                atom_idx = self.atom_idx
+            np.add.at(grad_accum, atom_idx, per_grid_grad)
         else:
             # d/d(R_A)_a = sum_j sum_x per_grid[j,x] * d(r_j)_x / d(R_A)_a
             grad_accum += np.einsum(
@@ -783,7 +789,8 @@ class GOSTSHYP(lib.StreamObject):
             del dG
 
             self._scatter_gaussian_center_grad(dgtilde_gaussian, dcoords_c,
-                                                gt_grad_chunk)
+                                                gt_grad_chunk,
+                                                atom_idx=atom_idx_c)
             gt_grad_chunk *= -1.0
             gtilde_operator_grad += gt_grad_chunk
             del dgtilde_braket, gt_grad_chunk, dgtilde_gaussian
@@ -846,7 +853,8 @@ class GOSTSHYP(lib.StreamObject):
             dG_f = np.einsum('xnij,ij->nx', dG_f, dm, optimize=True)
 
             self._scatter_gaussian_center_grad(dG_f, dcoords_c,
-                                                fop_grad_chunk)
+                                                fop_grad_chunk,
+                                                atom_idx=atom_idx_c)
             fop_grad_chunk *= -1.0
             force_operator_grad += fop_grad_chunk
             del dpq_ix, fop_grad_chunk, dG_f

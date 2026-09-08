@@ -24,6 +24,7 @@ EXTRAS = {
     'afqmc-cpu': ['jax'],
     'afqmc-cuda12': ['jax[cuda12]'],
     'afqmc-cuda13': ['jax[cuda13]'],
+    'moist': ['moist'],
 }
 VERSION = '1.1.1'
 
