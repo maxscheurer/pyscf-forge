@@ -161,6 +161,7 @@ class GOSTSHYP(lib.StreamObject):
         self.cavity = options.get('cavity', 'vdw/occ')
         self.r_ext = options.get('r_ext', 0.4724)  # Bohr (0.25 Ang)
         self.direct = options.get('direct', True)
+        self._drop_kwargs = options.get('drop_kwargs', None)
 
         self.frozen = False
         self.equilibrium_solvation = False
@@ -185,6 +186,30 @@ class GOSTSHYP(lib.StreamObject):
             self.mol = mol
         mol = self.mol
 
+        if self.cavity == 'drop':
+            self._build_drop(mol)
+        else:
+            self._build_gen_surface(mol)
+
+        if np.any(self.areas <= 0):
+            raise ValueError(
+                'Non-positive surface areas detected; cavity is degenerate.')
+        self.widths = np.pi * np.log(2) / self.areas
+        self.N_j = (self.widths / np.pi) ** 1.5  # Gaussian normalization
+        self.n_gaussian = len(self.areas)
+        self.surface_normals = compute_surface_normals(
+            mol.atom_coords(), self.grid_coords, self.atom_idx)
+
+        # Clear cached properties
+        self.__dict__.pop('gtilde', None)
+        self.__dict__.pop('force_operators', None)
+
+        logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
+                    self.n_gaussian, self.cavity)
+        return self
+
+    def _build_gen_surface(self, mol):
+        """Build cavity using PySCF's gen_surface (vdw or vdw/occ)."""
         rad = self.scaling_factor * modified_Bondi
 
         if self.cavity == 'vdw/occ':
@@ -221,23 +246,27 @@ class GOSTSHYP(lib.StreamObject):
 
         self.grid_coords = self.surface_dict['grid_coords']
         self.areas = self.surface_dict['area']
-        if np.any(self.areas <= 0):
-            raise ValueError(
-                'Non-positive surface areas detected; cavity is degenerate.')
         self.atom_idx = atom_idx
-        self.widths = np.pi * np.log(2) / self.areas
-        self.N_j = (self.widths / np.pi) ** 1.5  # Gaussian normalization
-        self.n_gaussian = len(self.areas)
-        self.surface_normals = compute_surface_normals(
-            mol.atom_coords(), self.grid_coords, self.atom_idx)
+        self._drop_cavity = None
 
-        # Clear cached properties
-        self.__dict__.pop('gtilde', None)
-        self.__dict__.pop('force_operators', None)
+    def _build_drop(self, mol):
+        """Build cavity using MOIST's DROPSvdW."""
+        from pyscf.solvent.moist import build_drop_cavity, get_surface_data
 
-        logger.info(self, 'GOSTSHYP: %d surface Gaussians (cavity=%s)',
-                    self.n_gaussian, self.cavity)
-        return self
+        drop_kwargs = {}
+        if self._drop_kwargs is not None:
+            drop_kwargs.update(self._drop_kwargs)
+
+        self._drop_cavity = build_drop_cavity(
+            mol, nleb=self.npoints, **drop_kwargs)
+
+        grid_coords, areas, owner = get_surface_data(self._drop_cavity)
+        self.grid_coords = grid_coords
+        self.areas = areas
+        self.atom_idx = owner
+        self.surface_dict = None
+        self._outer_surface_dict = None
+        self._occ_ratio_sq = None
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s ********', self.__class__)
@@ -248,6 +277,8 @@ class GOSTSHYP(lib.StreamObject):
         logger.info(self, 'cavity = %s', self.cavity)
         if self.cavity == 'vdw/occ':
             logger.info(self, 'r_ext = %.4f Bohr', self.r_ext)
+        if self.cavity == 'drop':
+            logger.info(self, 'using MOIST DROPSvdW cavity')
         logger.info(self, 'direct = %s', self.direct)
         logger.info(self, 'n_gaussian = %d', self.n_gaussian)
         return self
@@ -257,8 +288,8 @@ class GOSTSHYP(lib.StreamObject):
             raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
         if self.scaling_factor <= 0:
             raise ValueError(f'scaling_factor must be positive, got {self.scaling_factor}')
-        if self.cavity not in ('vdw', 'vdw/occ'):
-            raise ValueError(f"cavity must be 'vdw' or 'vdw/occ', got '{self.cavity}'")
+        if self.cavity not in ('vdw', 'vdw/occ', 'drop'):
+            raise ValueError(f"cavity must be 'vdw', 'vdw/occ', or 'drop', got '{self.cavity}'")
         if self.cavity == 'vdw/occ' and self.r_ext <= 0:
             raise ValueError(f'r_ext must be positive for vdw/occ cavity, got {self.r_ext}')
         return self
@@ -452,16 +483,101 @@ class GOSTSHYP(lib.StreamObject):
         self._grad_t_wall = _time.perf_counter() - _t0
         return result
 
+    # -----------------------------------------------------------------
+    # Surface-derivative helpers (abstract over gen_surface vs. DROP)
+    # -----------------------------------------------------------------
+
+    def _get_surface_derivatives(self):
+        """Return area derivatives and (for DROP) position/normal derivatives.
+
+        Returns
+        -------
+        dareas : ndarray of shape (natm, 3, ngrid)
+            d(a_i) / d(R_A)_alpha.
+        dcoords : ndarray of shape (3, 3, natm, ngrid) or None
+            d(r_i)_j / d(R_A)_alpha.  None for gen_surface (rigid grids).
+        dnormals : ndarray of shape (3, 3, natm, ngrid) or None
+            d(n_i)_c / d(R_A)_alpha.  None for gen_surface (rigid normals).
+        """
+        if self.cavity == 'drop':
+            from pyscf.solvent.moist import get_anchor_gradient
+            dareas, dcoords = get_anchor_gradient(self._drop_cavity)
+            dnormals = self._compute_normal_derivatives(dcoords)
+            return dareas, dcoords, dnormals
+        else:
+            if self._outer_surface_dict is not None:
+                _, dareas = get_dF_dA(self._outer_surface_dict)
+                dareas = dareas.transpose(1, 2, 0) * self._occ_ratio_sq
+            else:
+                _, dareas = get_dF_dA(self.surface_dict)
+                dareas = dareas.transpose(1, 2, 0)
+            return dareas, None, None
+
+    def _scatter_gaussian_center_grad(self, per_grid_grad, dcoords, grad_accum,
+                                      atom_idx=None):
+        """Scatter Gaussian-center derivatives to atoms.
+
+        For gen_surface, each grid point moves rigidly with its owning atom.
+        For DROP, each grid point depends on all atoms via dcoords.
+
+        Parameters
+        ----------
+        per_grid_grad : ndarray of shape (ngrid, 3)
+            d(quantity) / d(r_j)_x for each grid point j.
+        dcoords : ndarray of shape (3, 3, natm, ngrid) or None
+            Position derivatives.  None => rigid scatter to atom_idx.
+        grad_accum : ndarray of shape (natm, 3)
+            Gradient accumulator (modified in-place).
+        atom_idx : ndarray of shape (ngrid,) or None
+            Atom indices for scatter.  Defaults to self.atom_idx.
+            Must match per_grid_grad when using chunked evaluation.
+        """
+        if dcoords is None:
+            if atom_idx is None:
+                atom_idx = self.atom_idx
+            np.add.at(grad_accum, atom_idx, per_grid_grad)
+        else:
+            # d/d(R_A)_a = sum_j sum_x per_grid[j,x] * d(r_j)_x / d(R_A)_a
+            grad_accum += np.einsum(
+                'nx,xaAn->Aa', per_grid_grad, dcoords, optimize=True)
+
+    def _normal_derivative_term(self, dm, dnormals, nao, mol):
+        """Force-operator gradient from normal-vector change (DROP only).
+
+        For gen_surface cavities the normals are rigid and this returns zero.
+        For DROP, each normal depends on all nuclear positions.
+
+        Returns ndarray of shape (natm, 3).
+        """
+        if dnormals is None:
+            return 0.0
+
+        forces = self.forces
+        gtilde_expval = self.gtilde_expval
+
+        # Un-contracted p-type integrals: P_j_c = <D|2w N (r-R)_c exp(-w|r-R|^2)|D>
+        gmol_p = fakemol_for_gaussian(
+            self.grid_coords, self.widths, l=1,
+            coeffs=2.0 * self.widths * self.N_j)
+        supermol_p = mol + gmol_p
+        slices_p = (0, mol.nbas, 0, mol.nbas,
+                    mol.nbas, mol.nbas + gmol_p.nbas)
+        overlap3p = supermol_p.intor(
+            'int3c1e', shls_slice=slices_p
+        ).reshape(nao, nao, -1, 3)
+        P_gc = np.einsum('ijgc,ij->gc', overlap3p, dm, optimize=True)
+
+        # dE/dF_j = -p * a_j * <g_j> / F_j^2
+        dEdF = -self.pressure_au * self.areas * gtilde_expval / (forces * forces)
+
+        # dE_normal[A,a] = sum_j dEdF_j * sum_c P_j_c * d(n_j)_c/d(R_A)_a
+        return np.einsum('g,gc,caAg->Aa', dEdF, P_gc, dnormals, optimize=True)
+
     def _grad_cached(self, dm):
         """Cached gradient: uses precomputed gtilde and force_operators."""
         mol = self.mol
 
-        if self._outer_surface_dict is not None:
-            _, dareas = get_dF_dA(self._outer_surface_dict)
-            dareas = dareas.transpose(1, 2, 0) * self._occ_ratio_sq
-        else:
-            _, dareas = get_dF_dA(self.surface_dict)
-            dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+        dareas, dcoords, dnormals = self._get_surface_derivatives()
 
         forces = self.forces
         gtilde_expval = self.gtilde_expval
@@ -490,7 +606,8 @@ class GOSTSHYP(lib.StreamObject):
             'xnij,n,ij->nx', dG, self.amplitudes, dm, optimize=True)
         gtilde_operator_grad = np.asarray(
             [np.sum(dgtilde_braket[p0:p1], axis=0) for p0, p1 in aoslice[:, 2:]])
-        np.add.at(gtilde_operator_grad, self.atom_idx, dgtilde_gaussian)
+        self._scatter_gaussian_center_grad(dgtilde_gaussian, dcoords,
+                                           gtilde_operator_grad)
         gtilde_operator_grad *= -1.0
 
         # d-orbital width gradient
@@ -545,8 +662,12 @@ class GOSTSHYP(lib.StreamObject):
 
         force_operator_grad = np.asarray(
             [np.sum(dpq_ix[p0:p1], axis=0) for p0, p1 in aoslice[:, 2:]])
-        np.add.at(force_operator_grad, self.atom_idx, dG_f)
+        self._scatter_gaussian_center_grad(dG_f, dcoords, force_operator_grad)
         force_operator_grad *= -1.0
+
+        # Normal derivative term (non-zero only for DROP cavity)
+        dE_normal = self._normal_derivative_term(
+            dm, dnormals, nao, mol)
 
         # f-orbital width gradient for force operators
         coeffs_f2 = -2.0 * self.widths * wgrad_prefs
@@ -583,7 +704,7 @@ class GOSTSHYP(lib.StreamObject):
                 'g,g,axg,g->ax', self.areas, gtilde_expval,
                 dFdR, rf2, optimize=True))
 
-        dE3 = force_operator_grad + width_grad_ftype
+        dE3 = force_operator_grad + dE_normal + width_grad_ftype
 
         return dE1 + dE2 + dE3
 
@@ -595,12 +716,7 @@ class GOSTSHYP(lib.StreamObject):
         natm = mol.natm
         aoslice = mol.aoslice_by_atom()
 
-        if self._outer_surface_dict is not None:
-            _, dareas = get_dF_dA(self._outer_surface_dict)
-            dareas = dareas.transpose(1, 2, 0) * self._occ_ratio_sq
-        else:
-            _, dareas = get_dF_dA(self.surface_dict)
-            dareas = dareas.transpose(1, 2, 0)  # (natm, 3, ngrids)
+        dareas, dcoords, dnormals = self._get_surface_derivatives()
 
         forces = self.forces
         gtilde_expval = self.gtilde_expval
@@ -644,6 +760,7 @@ class GOSTSHYP(lib.StreamObject):
             wgrad_prefs_c = wgrad_prefs[chunk_idx]
             atom_idx_c = self.atom_idx[chunk_idx]
             dareas_c = dareas[:, :, chunk_idx]
+            dcoords_c = dcoords[:, :, :, chunk_idx] if dcoords is not None else None
 
             # --- Term 2: gtilde operator derivative ---
             # s-type ip1 bra/ket
@@ -671,7 +788,9 @@ class GOSTSHYP(lib.StreamObject):
                 'xnij,n,ij->nx', dG, amplitudes_c, dm, optimize=True)
             del dG
 
-            np.add.at(gt_grad_chunk, atom_idx_c, dgtilde_gaussian)
+            self._scatter_gaussian_center_grad(dgtilde_gaussian, dcoords_c,
+                                                gt_grad_chunk,
+                                                atom_idx=atom_idx_c)
             gt_grad_chunk *= -1.0
             gtilde_operator_grad += gt_grad_chunk
             del dgtilde_braket, gt_grad_chunk, dgtilde_gaussian
@@ -733,7 +852,9 @@ class GOSTSHYP(lib.StreamObject):
                 'xnpij,np->xnij', dG_f, normals_c, optimize=True)
             dG_f = np.einsum('xnij,ij->nx', dG_f, dm, optimize=True)
 
-            np.add.at(fop_grad_chunk, atom_idx_c, dG_f)
+            self._scatter_gaussian_center_grad(dG_f, dcoords_c,
+                                                fop_grad_chunk,
+                                                atom_idx=atom_idx_c)
             fop_grad_chunk *= -1.0
             force_operator_grad += fop_grad_chunk
             del dpq_ix, fop_grad_chunk, dG_f
@@ -775,9 +896,62 @@ class GOSTSHYP(lib.StreamObject):
                 dFdR, rf2_c, optimize=True)
 
         dE2 = gtilde_operator_grad + dE_d_total
-        dE3 = force_operator_grad + width_grad_ftype
+
+        # Normal derivative term (non-zero only for DROP cavity)
+        dE_normal = self._normal_derivative_term(dm, dnormals, nao, mol)
+
+        dE3 = force_operator_grad + dE_normal + width_grad_ftype
 
         return dE1 + dE2 + dE3
+
+
+    def _compute_normal_derivatives(self, dcoords):
+        """Compute derivatives of surface normals w.r.t. nuclear coordinates.
+
+        The surface normal at grid point j is defined as the inward-pointing
+        unit vector from the grid point to its owning atom center:
+            n_j = (R_{O(j)} - r_j) / |R_{O(j)} - r_j|
+
+        Parameters
+        ----------
+        dcoords : ndarray of shape (3, 3, natm, ngrid)
+            d(r_i)_j / d(R_A)_alpha from MOIST's AnchorGradient.
+
+        Returns
+        -------
+        dnormals : ndarray of shape (3, 3, natm, ngrid)
+            d(n_j)_c / d(R_A)_alpha.
+        """
+        atom_coords = self.mol.atom_coords()
+        natm = self.mol.natm
+        ngrid = self.n_gaussian
+        owner = self.atom_idx
+        grid_idx = np.arange(ngrid)
+
+        # v_j = R_{owner(j)} - r_j, d_j = |v_j|
+        v = atom_coords[owner] - self.grid_coords  # (ngrid, 3)
+        d = np.linalg.norm(v, axis=1)  # (ngrid,)
+        n = v / d[:, None]  # (ngrid, 3) — unit normals
+
+        # d(v_j)_c / d(R_A)_alpha = delta(A,O(j))*delta(c,alpha) - dcoords[c,alpha,A,j]
+        # d(n_j)_c / d(R_A)_alpha = (1/d_j) * [dv_c - n_c * (n · dv)]
+
+        dnormals = np.zeros((3, 3, natm, ngrid))
+
+        for alpha in range(3):
+            # Build dv_k for all k at this alpha: shape (3, natm, ngrid)
+            dv_all = -dcoords[:, alpha].copy()  # (3, natm, ngrid)
+            # Add delta(A,O(j))*delta(k,alpha) for k=alpha
+            dv_all[alpha, owner, grid_idx] += 1.0
+
+            # n · dv = sum_k n_k * dv_k: (natm, ngrid)
+            n_dot_dv = np.einsum('jg,jAg->Ag', n.T, dv_all, optimize=True)
+
+            for c in range(3):
+                # dv_c - n_c * (n · dv), divided by d
+                dnormals[c, alpha] = (dv_all[c] - n[:, c] * n_dot_dv) / d
+
+        return dnormals
 
     def reset(self, mol=None):
         """Reset for geometry optimization / scanner."""
