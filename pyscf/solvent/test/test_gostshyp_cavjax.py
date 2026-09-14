@@ -243,6 +243,16 @@ class TestCavJAXLifecycle(unittest.TestCase):
                 'cavity': 'cavjax', 'direct': False})
         self.assertEqual(_FakeBackend.instances, [])
 
+    def test_cached_mode_cannot_be_enabled_after_construction(self):
+        mol = self.make_mol()
+        gost = GOSTSHYP(mol, options={'cavity': 'cavjax'})
+        gost.direct = False
+        with mock.patch.object(
+                gost, '_kernel_cached',
+                side_effect=AssertionError('cached operators must not be used')):
+            with self.assertRaisesRegex(ValueError, 'direct=True'):
+                gost.kernel(np.eye(mol.nao_nr()))
+
 
 class TestCompactCotangents(unittest.TestCase):
     def test_matches_dense_rigid_surface_contraction(self):

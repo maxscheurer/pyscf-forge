@@ -184,8 +184,7 @@ class GOSTSHYP(lib.StreamObject):
             raise ValueError(
                 "cavity must be 'vdw', 'vdw/occ', 'drop', or 'cavjax', "
                 f"got '{self.cavity}'")
-        if self.cavity == 'cavjax' and not self.direct:
-            raise ValueError('The CavJAX cavity requires direct=True')
+        self._validate_cavjax_direct()
 
         self.frozen = False
         self.equilibrium_solvation = False
@@ -367,6 +366,11 @@ class GOSTSHYP(lib.StreamObject):
                     self._grad_cavjax_vjp_t_wall)
         return self
 
+    def _validate_cavjax_direct(self):
+        """Reject cached evaluation for the ownerless CavJAX surface."""
+        if self.cavity == 'cavjax' and not self.direct:
+            raise ValueError('The CavJAX cavity requires direct=True')
+
     def check_sanity(self):
         if self.pressure_mpa <= 0:
             raise ValueError(f'pressure_mpa must be positive, got {self.pressure_mpa}')
@@ -378,8 +382,7 @@ class GOSTSHYP(lib.StreamObject):
                 f"got '{self.cavity}'")
         if self.cavity == 'vdw/occ' and self.r_ext <= 0:
             raise ValueError(f'r_ext must be positive for vdw/occ cavity, got {self.r_ext}')
-        if self.cavity == 'cavjax' and not self.direct:
-            raise ValueError('The CavJAX cavity requires direct=True')
+        self._validate_cavjax_direct()
         return self
 
     def kernel(self, dm):
@@ -398,6 +401,7 @@ class GOSTSHYP(lib.StreamObject):
         import time as _time
         _t0 = _time.perf_counter()
 
+        self._validate_cavjax_direct()
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
@@ -558,6 +562,7 @@ class GOSTSHYP(lib.StreamObject):
         self._grad_cotangent_t_wall = 0.0
         self._grad_cavjax_vjp_t_wall = 0.0
 
+        self._validate_cavjax_direct()
         if self.forces is None:
             raise RuntimeError(
                 'kernel() must be called before grad(). '
@@ -812,211 +817,34 @@ class GOSTSHYP(lib.StreamObject):
         mem_per_grid = 18 * nao**2 * 8.0 / 1e6
         return max(1, int(max_memory / mem_per_grid))
 
-    def _grad_direct(self, dm):
-        """Integral-direct gradient: compute integrals on-the-fly in chunks."""
+    def _surface_cotangent_response(self, point_cotangent, area_cotangent,
+                                     normal_cotangent):
+        """Contract surface cotangents through the selected cavity geometry."""
         if self.cavity == 'cavjax':
-            return self._grad_direct_cavjax(dm)
-
-        mol = self.mol
-        nao = mol.nao_nr()
-        nao_cart = mol.nao_nr(cart=True)
-        natm = mol.natm
-        aoslice = mol.aoslice_by_atom()
+            return self._cavjax_backend.response(
+                self.mol.atom_coords(), point_cotangent, area_cotangent,
+                normal_cotangent)
 
         dareas, dcoords, dnormals = self._get_surface_derivatives()
+        response = np.einsum(
+            'acg,g->ac', dareas, area_cotangent, optimize=True)
+        self._scatter_gaussian_center_grad(
+            point_cotangent, dcoords, response)
+        if dnormals is not None:
+            response += np.einsum(
+                'gc,caAg->Aa', normal_cotangent, dnormals, optimize=True)
+        return response
 
-        forces = self.forces
-        gtilde_expval = self.gtilde_expval
-        amplitudes = self.amplitudes
-        wgrad_prefs = -np.pi * np.log(2) / (self.areas ** 2)
-
-        # Term 1: area derivative (no chunking needed)
-        dE1 = self.pressure_au * np.einsum(
-            'acg,g->ac', dareas, gtilde_expval / forces, optimize=True)
-
-        # Peak memory is approximately 18 * nao^2 * C * 8 bytes.
-        chunk_size = self._direct_gradient_chunk_size(nao)
-
-        if not mol.cart:
-            c2s = mol.cart2sph_coeff(normalized='sp')
-
-        shells = np.arange(self.n_gaussian)
-        chunks = [shells[i:i+chunk_size]
-                  for i in range(0, self.n_gaussian, chunk_size)]
-
-        gtilde_operator_grad = np.zeros((natm, 3))
-        dE_d_total = np.zeros((natm, 3))
-        force_operator_grad = np.zeros((natm, 3))
-        width_grad_ftype = np.zeros((natm, 3))
-
-        for chunk_idx in chunks:
-            C = len(chunk_idx)
-
-            # --- Build chunk-local fakemols ---
-            coords_c = self.grid_coords[chunk_idx]
-            widths_c = self.widths[chunk_idx]
-            N_j_c = self.N_j[chunk_idx]
-            areas_c = self.areas[chunk_idx]
-            normals_c = self.surface_normals[chunk_idx]
-            amplitudes_c = amplitudes[chunk_idx]
-            forces_c = forces[chunk_idx]
-            gtilde_expval_c = gtilde_expval[chunk_idx]
-            wgrad_prefs_c = wgrad_prefs[chunk_idx]
-            atom_idx_c = self.atom_idx[chunk_idx]
-            dareas_c = dareas[:, :, chunk_idx]
-            dcoords_c = dcoords[:, :, :, chunk_idx] if dcoords is not None else None
-
-            # --- Term 2: gtilde operator derivative ---
-            # s-type ip1 bra/ket
-            gmol_s = fakemol_for_gaussian(coords_c, widths_c, coeffs=N_j_c)
-            supermol_s = mol + gmol_s
-            slices_s = (0, mol.nbas, 0, mol.nbas,
-                        mol.nbas, mol.nbas + gmol_s.nbas)
-            slices_sg = (mol.nbas, mol.nbas + gmol_s.nbas,
-                         0, mol.nbas, 0, mol.nbas)
-
-            dPQ = supermol_s.intor('int3c1e_ip1', shls_slice=slices_s)
-            dPQ = np.einsum('xijn,n->xij', dPQ, amplitudes_c, optimize=True)
-
-            dgtilde_braket = np.einsum('xij,ij->ix', dPQ, dm, optimize=True)
-            dgtilde_braket += np.einsum('xij,ji->ix', dPQ, dm, optimize=True)
-            del dPQ
-
-            gt_grad_chunk = np.asarray(
-                [np.sum(dgtilde_braket[p0:p1], axis=0)
-                 for p0, p1 in aoslice[:, 2:]])
-
-            # s-type ip1 Gaussian center
-            dG = supermol_s.intor('int3c1e_ip1', shls_slice=slices_sg)
-            dgtilde_gaussian = np.einsum(
-                'xnij,n,ij->nx', dG, amplitudes_c, dm, optimize=True)
-            del dG
-
-            self._scatter_gaussian_center_grad(dgtilde_gaussian, dcoords_c,
-                                                gt_grad_chunk,
-                                                atom_idx=atom_idx_c)
-            gt_grad_chunk *= -1.0
-            gtilde_operator_grad += gt_grad_chunk
-            del dgtilde_braket, gt_grad_chunk, dgtilde_gaussian
-
-            # d-type width gradient
-            gmol_d = fakemol_for_gaussian(
-                coords_c, widths_c, l=2,
-                coeffs=wgrad_prefs_c * amplitudes_c * N_j_c)
-            supermol_d = mol + gmol_d
-            supermol_d.cart = True
-            slices_d = (0, mol.nbas, 0, mol.nbas,
-                        mol.nbas, mol.nbas + gmol_d.nbas)
-            overlap3d = supermol_d.intor(
-                'int3c1e', shls_slice=slices_d
-            ).reshape(nao_cart, nao_cart, C, 6)
-
-            if not mol.cart:
-                overlap3d = np.einsum(
-                    'ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s, optimize=True)
-
-            diagd = (overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3]
-                     + overlap3d[:, :, :, 5])
-            imd = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
-            dE_d_total -= np.einsum('acg,g->ac', dareas_c, imd, optimize=True)
-            del overlap3d, diagd, imd
-
-            # --- Term 3: force operator derivative ---
-            coeffs_fop_c = (
-                -2.0 * self.pressure_au * areas_c * gtilde_expval_c
-                * widths_c / (forces_c * forces_c))
-
-            # p-type ip1 bra/ket
-            gmol_f = fakemol_for_gaussian(
-                coords_c, widths_c, l=1, coeffs=coeffs_fop_c * N_j_c)
-            supermol_f = mol + gmol_f
-            slices_f = (0, mol.nbas, 0, mol.nbas,
-                        mol.nbas, mol.nbas + gmol_f.nbas)
-            dpq = supermol_f.intor(
-                'int3c1e_ip1', shls_slice=slices_f
-            ).reshape(3, nao, nao, C, 3)
-            dpq *= normals_c
-
-            dpq_ix = np.einsum('xijnp,ij->ix', dpq, dm, optimize=True)
-            dpq_ix += np.einsum('xijnp,ji->ix', dpq, dm, optimize=True)
-            del dpq
-
-            fop_grad_chunk = np.asarray(
-                [np.sum(dpq_ix[p0:p1], axis=0)
-                 for p0, p1 in aoslice[:, 2:]])
-
-            # p-type ip1 Gaussian center
-            slices_fg = (mol.nbas, mol.nbas + gmol_f.nbas,
-                         0, mol.nbas, 0, mol.nbas)
-            dG_f = supermol_f.intor(
-                'int3c1e_ip1', shls_slice=slices_fg
-            ).reshape(3, C, 3, nao, nao)
-
-            dG_f = np.einsum(
-                'xnpij,np->xnij', dG_f, normals_c, optimize=True)
-            dG_f = np.einsum('xnij,ij->nx', dG_f, dm, optimize=True)
-
-            self._scatter_gaussian_center_grad(dG_f, dcoords_c,
-                                                fop_grad_chunk,
-                                                atom_idx=atom_idx_c)
-            fop_grad_chunk *= -1.0
-            force_operator_grad += fop_grad_chunk
-            del dpq_ix, fop_grad_chunk, dG_f
-
-            # f-type width gradient for force operators
-            coeffs_f2_c = -2.0 * widths_c * wgrad_prefs_c
-            gmol_ft = fakemol_for_gaussian(
-                coords_c, widths_c, l=3, coeffs=coeffs_f2_c * N_j_c)
-            supermol_ft = mol + gmol_ft
-            supermol_ft.cart = True
-            slices_ft = (0, mol.nbas, 0, mol.nbas,
-                         mol.nbas, mol.nbas + gmol_ft.nbas)
-            overlap3f = supermol_ft.intor(
-                'int3c1e', shls_slice=slices_ft
-            ).reshape(nao_cart, nao_cart, C, 10)
-
-            if not mol.cart:
-                overlap3f = np.einsum(
-                    'ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s, optimize=True)
-
-            xf = (overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3]
-                  + overlap3f[:, :, :, 5])
-            yf = (overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6]
-                  + overlap3f[:, :, :, 8])
-            zf = (overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7]
-                  + overlap3f[:, :, :, 9])
-            dx = np.einsum('ijg,ij->g', xf, dm, optimize=True)
-            dy = np.einsum('ijg,ij->g', yf, dm, optimize=True)
-            dz = np.einsum('ijg,ij->g', zf, dm, optimize=True)
-            dr = np.vstack((dx, dy, dz)).T
-            del overlap3f, xf, yf, zf
-
-            rf2_c = 1.0 / (forces_c * forces_c)
-            dr *= normals_c
-            dFdR = dareas_c * wgrad_prefs_c * forces_c / widths_c
-            dFdR += np.einsum('gc,axg->axg', dr, dareas_c, optimize=True)
-            width_grad_ftype -= self.pressure_au * np.einsum(
-                'g,g,axg,g->ax', areas_c, gtilde_expval_c,
-                dFdR, rf2_c, optimize=True)
-
-        dE2 = gtilde_operator_grad + dE_d_total
-
-        # Normal derivative term (non-zero only for DROP cavity)
-        dE_normal = self._normal_derivative_term(dm, dnormals, nao, mol)
-
-        dE3 = force_operator_grad + dE_normal + width_grad_ftype
-
-        return dE1 + dE2 + dE3
-
-    def _grad_direct_cavjax(self, dm):
-        """Direct gradient with compact point/area/normal cotangents."""
+    def _grad_direct(self, dm):
+        """Direct gradient from shared compact surface cotangents."""
         started = time.perf_counter()
-        integral_wall = [0.0]
+        integral_wall = 0.0
 
         def intor(supermol, name, **kwargs):
+            nonlocal integral_wall
             t0 = time.perf_counter()
             value = supermol.intor(name, **kwargs)
-            integral_wall[0] += time.perf_counter() - t0
+            integral_wall += time.perf_counter() - t0
             return value
 
         mol = self.mol
@@ -1037,7 +865,8 @@ class GOSTSHYP(lib.StreamObject):
         normal_cotangent = np.zeros((q, 3))
 
         chunk_size = self._direct_gradient_chunk_size(nao)
-        chunks = [np.arange(q)[i:i + chunk_size]
+        indices = np.arange(q)
+        chunks = [indices[i:i + chunk_size]
                   for i in range(0, q, chunk_size)]
         if not mol.cart:
             c2s = mol.cart2sph_coeff(normalized='sp')
@@ -1130,20 +959,23 @@ class GOSTSHYP(lib.StreamObject):
                 'xnij,ij->nx', dG_f, dm, optimize=True)
             del dG_f, supermol_f, gmol_f
 
-            # The force is linear in the stored inward normal.
-            gmol_p = fakemol_for_gaussian(
-                coords_c, widths_c, l=1,
-                coeffs=2.0 * widths_c * norms_c)
-            supermol_p = mol + gmol_p
-            slices_p = (0, mol.nbas, 0, mol.nbas,
-                        mol.nbas, mol.nbas + gmol_p.nbas)
-            overlap3p = intor(
-                supermol_p, 'int3c1e', shls_slice=slices_p
-            ).reshape(nao, nao, c, 3)
-            p_expectation = np.einsum(
-                'ijgc,ij->gc', overlap3p, dm, optimize=True)
-            normal_cotangent[chunk_idx] = dEdF_c[:, None] * p_expectation
-            del overlap3p, p_expectation, supermol_p, gmol_p
+            # The force is linear in the stored inward normal. Generated
+            # atom-centered surfaces have rigid normals, so they need no
+            # normal cotangent or corresponding p-type integral.
+            if self.cavity in ('drop', 'cavjax'):
+                gmol_p = fakemol_for_gaussian(
+                    coords_c, widths_c, l=1,
+                    coeffs=2.0 * widths_c * norms_c)
+                supermol_p = mol + gmol_p
+                slices_p = (0, mol.nbas, 0, mol.nbas,
+                            mol.nbas, mol.nbas + gmol_p.nbas)
+                overlap3p = intor(
+                    supermol_p, 'int3c1e', shls_slice=slices_p
+                ).reshape(nao, nao, c, 3)
+                p_expectation = np.einsum(
+                    'ijgc,ij->gc', overlap3p, dm, optimize=True)
+                normal_cotangent[chunk_idx] = dEdF_c[:, None] * p_expectation
+                del overlap3p, p_expectation, supermol_p, gmol_p
 
             # Width and normalization response of the force operator.
             gmol_ft = fakemol_for_gaussian(
@@ -1174,19 +1006,22 @@ class GOSTSHYP(lib.StreamObject):
             area_cotangent[chunk_idx] += dEdF_c * dF_darea
             del overlap3f, traced, dr, supermol_ft, gmol_ft
 
-        before_vjp = time.perf_counter()
-        self._grad_integral_t_wall = integral_wall[0]
+        before_response = time.perf_counter()
+        self._grad_integral_t_wall = integral_wall
         self._grad_cotangent_t_wall = max(
-            0.0, before_vjp - started - integral_wall[0])
+            0.0, before_response - started - integral_wall)
         response_started = time.perf_counter()
-        geometry_response = self._cavjax_backend.response(
-            mol.atom_coords(), point_cotangent, area_cotangent,
-            normal_cotangent)
-        self._grad_cavjax_vjp_t_wall = time.perf_counter() - response_started
-        logger.info(
-            self, 'CavJAX gradient timings: integrals %.3f s, cotangents %.3f s, '
-            'VJP %.3f s', self._grad_integral_t_wall,
-            self._grad_cotangent_t_wall, self._grad_cavjax_vjp_t_wall)
+        geometry_response = self._surface_cotangent_response(
+            point_cotangent, area_cotangent, normal_cotangent)
+        if self.cavity == 'cavjax':
+            self._grad_cavjax_vjp_t_wall = (
+                time.perf_counter() - response_started)
+            logger.info(
+                self, 'CavJAX gradient timings: integrals %.3f s, '
+                'cotangents %.3f s, VJP %.3f s',
+                self._grad_integral_t_wall,
+                self._grad_cotangent_t_wall,
+                self._grad_cavjax_vjp_t_wall)
         return explicit_nuclear + geometry_response
 
     def _compute_normal_derivatives(self, dcoords):
