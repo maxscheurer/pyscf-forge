@@ -25,6 +25,9 @@ EXTRAS = {
     'afqmc-cuda12': ['jax[cuda12]'],
     'afqmc-cuda13': ['jax[cuda13]'],
     'moist': ['moist'],
+    'cavjax': [
+        'cavjax @ git+https://github.com/maxscheurer/cavjax.git@b2d0aa8'
+    ],
 }
 VERSION = '1.1.1'
 
