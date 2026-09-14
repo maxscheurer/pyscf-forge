@@ -29,7 +29,7 @@ EXTRAS = {
         'cavjax @ git+https://github.com/maxscheurer/cavjax.git@b2d0aa8'
     ],
 }
-VERSION = '1.2.0'
+VERSION = '1.1.1'
 
 #######################################################################
 # Unless not working, nothing below needs to be changed.
