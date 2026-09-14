@@ -27,3 +27,22 @@ jobs:
         run: ./.github/workflows/run_ci.sh
       - name: Test with pytest
         run: ./.github/workflows/test.sh
+
+  cavjax-integration:
+    runs-on: ubuntu-latest
+    env:
+      JAX_ENABLE_X64: "1"
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Install base package
+        run: ./.github/workflows/run_ci.sh
+      - name: Install pinned CavJAX
+        run: pip install "cavjax @ git+https://github.com/maxscheurer/cavjax.git@b2d0aa8"
+      - name: Test CavJAX integration and solvent regressions
+        run: |
+          pytest -q pyscf/solvent/test/test_gostshyp_cavjax.py
+          pytest -q pyscf/solvent/test/test_gostshyp.py -k 'not _slow'

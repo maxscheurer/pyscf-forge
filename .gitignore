@@ -141,3 +141,7 @@ multigrid/
 **/multigrid/
 examples/occri/multigrid/
 pytest.ini
+
+.dreb
+libcint
+scratch
