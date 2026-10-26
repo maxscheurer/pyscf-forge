@@ -135,15 +135,21 @@ def _symmetrize(dm):
     return 0.5 * (dm + dm.T)
 
 
-def _area_derivatives(gost):
-    """First and second area derivatives, (natm,3,ng) and (natm,natm,3,3,ng)."""
+def _area_derivatives(gost, second=True):
+    """First and second area derivatives, (natm,3,ng) and (natm,natm,3,3,ng).
+
+    The second derivative is None if second=False.
+    """
     if gost._outer_surface_dict is not None:
         surface, scale = gost._outer_surface_dict, gost._occ_ratio_sq
     else:
         surface, scale = gost.surface_dict, 1.0
     _, dA = get_dF_dA(surface)
+    dA = dA.transpose(1, 2, 0) * scale
+    if not second:
+        return dA, None
     _, d2A = get_d2F_d2A(surface)
-    return dA.transpose(1, 2, 0) * scale, d2A * scale
+    return dA, d2A * scale
 
 
 def _grid_chunks(gost, n_nao2_per_grid):
@@ -187,6 +193,30 @@ def _contract_dm(ints, dm):
     keeps both operands unit-stride along i, so no copies are made.
     """
     return np.einsum('...ija,ji->...ia', ints, dm)
+
+
+def _contract_aux(coef, ints):
+    """Σ_a coef[..., a] · ints[comp, i, j, a] → (..., comp, nao, nao).
+
+    The integral buffers are Fortran-ordered in (i, j, a), i.e. (comp, a, j, i)
+    is C-contiguous, so each component is a single GEMM.
+    """
+    if ints.ndim == 3:
+        ints = ints[None]
+    comp, nao, _, naux = ints.shape
+    buf = ints.transpose(0, 3, 2, 1)
+    lead = coef.shape[:-1]
+    coef = coef.reshape(-1, naux)
+    out = np.empty((coef.shape[0], comp, nao, nao))
+    for x in range(comp):
+        out[:, x] = (coef @ buf[x].reshape(naux, nao * nao)
+                     ).reshape(-1, nao, nao).transpose(0, 2, 1)
+    return out.reshape(lead + (comp, nao, nao))
+
+
+def _expand_normals(coef, normals):
+    """Per-grid coefficients → per p-type component: coef[..., g] · n[g, c]."""
+    return (coef[..., :, None] * normals).reshape(coef.shape[:-1] + (-1,))
 
 
 def _contract_normals(x, normals):
@@ -279,7 +309,7 @@ def _outer_sum(a, b):
 # First-order quantities shared by traces, d²e and d²F
 # ---------------------------------------------------------------------------
 
-def _first_order_terms(gost, dm):
+def _first_order_terms(gost, dm, hessian=True):
     """Per-grid traces and their position derivatives (at fixed width).
 
     Keys:
@@ -287,6 +317,9 @@ def _first_order_terms(gost, dm):
       r2_pos, fr2_pos: ∂/∂R of Tr[D r²G̃] and f_contracted     (natm, 3, ng)
       r2, r4         : Tr[D r² G̃], Tr[D r⁴ G̃]                 (ng,)
       fr2, fr4       : f_contracted, h5 (p-type r², r⁴ traces) (ng,)
+
+    With hessian=False only e_pos, F_pos, r2 and fr2 are computed, which is
+    all the nuclear gradient needs.
     """
     mol = gost.mol
     dm = _symmetrize(dm)
@@ -295,9 +328,11 @@ def _first_order_terms(gost, dm):
     U = _ao_to_atom(mol)
     O = _grid_to_atom(gost)
 
-    out = {k: np.zeros((natm, 3, ngrids))
-           for k in ('e_pos', 'F_pos', 'r2_pos', 'fr2_pos')}
-    out.update({k: np.zeros(ngrids) for k in ('r2', 'r4', 'fr2', 'fr4')})
+    out = {k: np.zeros((natm, 3, ngrids)) for k in ('e_pos', 'F_pos')}
+    out.update({k: np.zeros(ngrids) for k in ('r2', 'fr2')})
+    if hessian:
+        out.update({k: np.zeros((natm, 3, ngrids)) for k in ('r2_pos', 'fr2_pos')})
+        out.update({k: np.zeros(ngrids) for k in ('r4', 'fr4')})
 
     # Largest live buffer: p-type ip1, 3 comps x 3 aux comps per grid point
     for g0, g1 in _grid_chunks(gost, 9):
@@ -310,22 +345,25 @@ def _first_order_terms(gost, dm):
         # s-type: Gtilde and its r², r⁴ moments
         out['e_pos'][..., sl] = _deriv1(
             _int3c(mol, X, w, 'int3c1e_ip1', 3), dm, U, Oc)
-        out['r2_pos'][..., sl] = _deriv1(
-            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3), dm, U, Oc)
         out['r2'][sl] = _trace(_int3c(mol, X, w, 'int3c1e_r2_origk', 1), dm)
-        out['r4'][sl] = _trace(_int3c(mol, X, w, 'int3c1e_r4_origk', 1), dm)
 
         # p-type: Fhat (coeff 2ω) and its width moments
         out['F_pos'][..., sl] = _deriv1(
             _int3c(mol, X, w, 'int3c1e_ip1', 3, l=1, coeffs=2.0 * w),
             dm, U, Oc, normals=n)
         # ∂Fhat/∂ω = Fhat/ω + f_contracted, with f = -2ω · r² p-type
-        out['fr2_pos'][..., sl] = _deriv1(
-            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3, l=1, coeffs=-2.0 * w),
-            dm, U, Oc, normals=n)
         out['fr2'][sl] = _trace(
             _int3c(mol, X, w, 'int3c1e_r2_origk', 1, l=1, coeffs=-2.0 * w),
             dm, normals=n)
+
+        if not hessian:
+            continue
+        out['r2_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3), dm, U, Oc)
+        out['r4'][sl] = _trace(_int3c(mol, X, w, 'int3c1e_r4_origk', 1), dm)
+        out['fr2_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3, l=1, coeffs=-2.0 * w),
+            dm, U, Oc, normals=n)
         # ∂²Fhat/∂ω² = 2 f_contracted/ω + h5, with h5 = 2ω · r⁴ p-type
         out['fr4'][sl] = _trace(
             _int3c(mol, X, w, 'int3c1e_r4_origk', 1, l=1, coeffs=2.0 * w),
@@ -346,9 +384,9 @@ def _compute_scalar_traces(gost, dm, first=None, dA=None):
     dF_trace : ndarray (natm, 3, ngrids)
     """
     if first is None:
-        first = _first_order_terms(gost, dm)
+        first = _first_order_terms(gost, dm, hessian=False)
     if dA is None:
-        dA = _area_derivatives(gost)[0]
+        dA = _area_derivatives(gost, second=False)[0]
     wgrad_prefs = -np.pi * np.log(2) / (gost.areas ** 2)  # dω/dA
 
     # Width contribution: dω/dR · ∂e/∂ω with ∂e/∂ω = -Tr[D r² G̃]
@@ -446,3 +484,122 @@ def _compute_d2F(gost, dm, first=None, dA=None, d2A=None):
     d2Fhat_domega2 = 2.0 * first['fr2'] / widths + first['fr4']
     d2F += _outer(wdA, wdA * d2Fhat_domega2)
     return d2F
+
+
+# ---------------------------------------------------------------------------
+# dV/dR at fixed density — right-hand side of the CPHF equations
+# ---------------------------------------------------------------------------
+
+def grad_vmat(gost, dm):
+    """Derivative of the GOSTSHYP Fock matrix w.r.t. all nuclear coordinates.
+
+    V = Σ_g [α_g G̃_g + β_g F̂_g], with α_g = P·A_g/F_g and
+    β_g = -P·A_g·e_g/F_g², differentiated at fixed D.
+
+    Returns
+    -------
+    dV : ndarray (natm, 3, nao, nao)
+    """
+    mol = gost.mol
+    natm = mol.natm
+    nao = mol.nao_nr()
+    dm = _symmetrize(dm)
+    P = gost.pressure_au
+    areas = gost.areas
+    widths = gost.widths
+    forces = gost.forces
+    e_g = gost.gtilde_expval
+    wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
+
+    dA = _area_derivatives(gost, second=False)[0]
+    dg_trace, dF_trace = _compute_scalar_traces(gost, dm, dA=dA)
+
+    # Coefficient response: dα/dR, dβ/dR
+    alpha = gost.amplitudes
+    beta = -P * areas * e_g / forces**2
+    inv_F = 1.0 / forces
+    dalpha = P * (dA * inv_F - areas * dF_trace * inv_F**2)
+    dbeta = -P * (dA * (e_g * inv_F**2) + dg_trace * (areas * inv_F**2)
+                  - 2.0 * dF_trace * (areas * e_g * inv_F**3))
+    # Masked grid points (negative amplitudes clamped to zero by kernel()):
+    # α=0 is a hard clamp so dα=0; F is frozen at 1.0, so dβ has no dF term.
+    mask = (alpha == 0.0)
+    if mask.any():
+        dalpha[..., mask] = 0.0
+        dbeta[..., mask] = -P * (dA[..., mask] * e_g[mask]
+                                 + areas[mask] * dg_trace[..., mask])
+
+    # Matrices multiplying each integral class:
+    #   G̃          : dα                       (coefficient response)
+    #   r² G̃       : -α·dω/dR                 (∂G̃/∂ω = -r²G̃)
+    #   F̂          : dβ + β·dω/dR / ω         (∂F̂/∂ω = F̂/ω + f)
+    #   f (= -2ω r² p-type) : β·dω/dR
+    coef_G = dalpha
+    coef_r2 = -(alpha * wgrad_prefs) * dA
+    coef_F = dbeta + (beta * wgrad_prefs / widths) * dA
+    coef_f = (beta * wgrad_prefs) * dA
+
+    O = _grid_to_atom(gost)
+    dV = np.zeros((natm, 3, nao, nao))
+    # Position derivatives: Y = Σ_g c_g ∂_μ(μν|g), Z_A = Σ_{g on A} c_g ∂_μ(μν|g)
+    Y = np.zeros((3, nao, nao))
+    Z = np.zeros((natm, 3, nao, nao))
+
+    for g0, g1 in _grid_chunks(gost, 12):
+        X = gost.grid_coords[g0:g1]
+        w = widths[g0:g1]
+        n = gost.surface_normals[g0:g1]
+        sl = slice(g0, g1)
+
+        # s-type: G̃ and its width derivative
+        dV += _contract_aux(coef_G[..., sl], _int3c(mol, X, w, 'int3c1e', 1))[:, :, 0]
+        dV += _contract_aux(coef_r2[..., sl],
+                            _int3c(mol, X, w, 'int3c1e_r2_origk', 1))[:, :, 0]
+        ip = _int3c(mol, X, w, 'int3c1e_ip1', 3)     # ip1 = -∂/∂R_μ
+        Y -= _contract_aux(alpha[sl], ip)
+        Z -= _contract_aux(O[:, sl] * alpha[sl], ip)
+        del ip
+
+        # p-type (coeff 2ω), contracted with normals: F̂ and its width derivative
+        dV += _contract_aux(_expand_normals(coef_F[..., sl], n),
+                            _int3c(mol, X, w, 'int3c1e', 1, l=1, coeffs=2.0 * w))[:, :, 0]
+        dV += _contract_aux(_expand_normals(coef_f[..., sl], n),
+                            _int3c(mol, X, w, 'int3c1e_r2_origk', 1, l=1,
+                                   coeffs=-2.0 * w))[:, :, 0]
+        ip = _int3c(mol, X, w, 'int3c1e_ip1', 3, l=1, coeffs=2.0 * w)
+        Y -= _contract_aux(_expand_normals(beta[sl], n), ip)
+        Z -= _contract_aux(_expand_normals(O[:, sl] * beta[sl], n), ip)
+        del ip
+
+    # Bra term on atom A's rows, ket term = its transpose; the Gaussian-center
+    # term is -(∂_μ + ∂_ν) on the Gaussians of atom A.
+    U = _ao_to_atom(mol)
+    W = U[:, None, :, None] * Y - Z
+    dV += W + W.transpose(0, 1, 3, 2)
+    return 0.5 * (dV + dV.transpose(0, 1, 3, 2))
+
+
+# ---------------------------------------------------------------------------
+# Nuclear gradient
+# ---------------------------------------------------------------------------
+
+def grad(gost, dm):
+    """Nuclear gradient of the GOSTSHYP energy at fixed density.
+
+    dE/dR = P Σ_g dA_g·e_g/F_g + Σ_g α_g·de_g/dR + Σ_g β_g·dF_g/dR,
+    with α_g = P·A_g/F_g (the amplitudes) and β_g = -P·A_g·e_g/F_g².
+
+    Returns
+    -------
+    de : ndarray (natm, 3)
+    """
+    dm = _symmetrize(dm)
+    P = gost.pressure_au
+    e_g = gost.gtilde_expval
+    F_g = gost.forces
+    dA = _area_derivatives(gost, second=False)[0]
+    dg_trace, dF_trace = _compute_scalar_traces(gost, dm, dA=dA)
+    beta = -P * gost.areas * e_g / F_g**2
+    return (P * dA @ (e_g / F_g)
+            + dg_trace @ gost.amplitudes
+            + dF_trace @ beta)
