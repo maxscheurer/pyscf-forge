@@ -35,6 +35,7 @@ import numpy as np
 from functools import cached_property
 
 from pyscf import gto, lib, scf
+from pyscf.gto import moleintor
 from pyscf.lib import logger
 from pyscf.solvent import _attach_solvent
 from pyscf.solvent.pcm import gen_surface, modified_Bondi
@@ -42,6 +43,15 @@ from pyscf.solvent.grad.pcm import get_dF_dA
 
 # Pressure conversion: 1 MPa = 3.3989309735473356e-08 Hartree/Bohr^3
 MPA_TO_AU = 3.3989309735473356e-08
+
+# libcint >= 6.2.0 provides the int3c1e second derivatives needed by the
+# Hessian, but PySCF does not register them in its intor table (yet).
+moleintor._INTOR_FUNCTIONS.update({
+    'int3c1e_ipip1': (9, 9),
+    'int3c1e_ip1ip2': (9, 9),
+    'int3c1e_ipvip1': (9, 9),
+    'int3c1e_ipip2': (9, 9),
+})
 
 
 def fakemol_for_gaussian(coords, exponents, l=0, cart=True, coeffs=None):
