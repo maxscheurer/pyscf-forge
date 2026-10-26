@@ -1519,13 +1519,22 @@ def make_hess_object(base_method):
         raise RuntimeError('Frozen solvent model is not available for energy hessian')
 
     vac_mf = base_method.undo_solvent()
-    # Call Hessian from the class (not the instance) to avoid recursion
-    # from the instance-level override we install in gostshyp_for_scf
-    vac_hess = type(vac_mf).Hessian(vac_mf)
+    vac_hess = vac_mf.Hessian()
     vac_hess.base = base_method
     name = with_solvent.__class__.__name__ + vac_hess.__class__.__name__
     return lib.set_class(WithGOSTSHYPHess(vac_hess),
                          (WithGOSTSHYPHess, vac_hess.__class__), name)
+
+
+class SCFWithGOSTSHYP(_attach_solvent.SCFWithSolvent):
+    """SCFWithSolvent that uses the GOSTSHYP Hessian instead of the PCM one.
+
+    The override lives on the class (not the instance), so that
+    undo_solvent() drops it together with SCFWithSolvent.
+    """
+
+    def Hessian(self):
+        return make_hess_object(self)
 
 
 def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
@@ -1538,10 +1547,10 @@ def gostshyp_for_scf(mf, solvent_obj=None, dm=None):
         solvent_obj = GOSTSHYP(mf.mol)
     sol_mf = _attach_solvent._for_scf(mf, solvent_obj, dm)
 
-    # Override the inherited PCM Hessian hook with GOSTSHYP's own
-    def _hessian(self):
-        return make_hess_object(self)
-    sol_mf.Hessian = _hessian.__get__(sol_mf)
+    # Replace the inherited PCM Hessian hook with GOSTSHYP's own
+    cls = sol_mf.__class__
+    if not issubclass(cls, SCFWithGOSTSHYP):
+        lib.set_class(sol_mf, (SCFWithGOSTSHYP,) + cls.__bases__[1:], cls.__name__)
     return sol_mf
 
 

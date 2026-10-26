@@ -17,6 +17,7 @@ import unittest
 import numpy as np
 import pytest
 from pyscf import gto, scf
+from pyscf.solvent._attach_solvent import _Solvation
 from pyscf.solvent.gostshyp import (
     GOSTSHYP, gostshyp_for_scf, compute_surface_normals, analytical_grad_vmat,
     WithGOSTSHYPHess, make_hess_object
@@ -636,6 +637,27 @@ class TestHessianInfrastructure(unittest.TestCase):
 
     def test_hessian_hook_type(self):
         self.assertIsInstance(self.mf.Hessian(), WithGOSTSHYPHess)
+
+    def test_undo_solvent_gives_vacuum_hessian(self):
+        mf = gostshyp_for_scf(scf.RHF(self.mol), GOSTSHYP(self.mol, options={
+            'cavity': 'vdw', 'pressure_mpa': 50_000, 'npoints': 26}))
+        mf_vac = mf.undo_solvent()
+        self.assertNotIsInstance(mf_vac, _Solvation)
+        self.assertNotIsInstance(mf_vac.Hessian(), WithGOSTSHYPHess)
+
+        # Converged vacuum SCF through the undone object must be plain RHF
+        ref = scf.RHF(self.mol)
+        for m in (mf_vac, ref):
+            m.conv_tol = 1e-12
+            m.kernel()
+        self.assertAlmostEqual(mf_vac.e_tot, ref.e_tot, 9)
+        np.testing.assert_allclose(mf_vac.Hessian().kernel(),
+                                   ref.Hessian().kernel(), atol=1e-8)
+
+    def test_reattach_keeps_gostshyp_hessian(self):
+        mf = gostshyp_for_scf(self.mf, self.gost)
+        self.assertIs(mf, self.mf)
+        self.assertIsInstance(mf.Hessian(), WithGOSTSHYPHess)
 
     def test_uhf_hessian_runs(self):
         mol = gto.M(atom='H 1 0 0; F 2 0 0', basis='sto-3g',
