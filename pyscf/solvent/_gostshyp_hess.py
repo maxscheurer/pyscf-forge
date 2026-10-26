@@ -22,11 +22,21 @@ and the force trace (F) up to second order.
 
 The assembly uses 10 terms (H1–H10) from the product rule applied to A·e/F.
 Each of d²e and d²F decomposes into 5 groups:
-  G1: position × position (ipip1, ipvip1, ip1ip2, ipip2 integrals)
+  G1: position × position
   G2: forward cross (dω/dR_By · ∂²/∂pos_Ax∂ω)
   G3: reverse cross (dω/dR_Ax · ∂²/∂pos_By∂ω)
   G4: d²ω piece (d²ω/(dR_Ax dR_By) · ∂/∂ω)
   G5: ω×ω piece (dω/dR_Ax · dω/dR_By · ∂²/∂ω²)
+
+Implementation notes:
+  - Every auxiliary function depends on r - K only, so ∂/∂K = -(∂/∂R_i + ∂/∂R_j).
+    Position derivatives therefore need only bra-side integrals (ip1, ipip1,
+    ipvip1); the Gaussian-center contributions follow from a translation
+    projection (_project1, _project2).
+  - Width derivatives multiply the Gaussian by powers of r_K², which are
+    evaluated with int3c1e_r{2,4}_origk on s- or p-type auxiliaries.
+  - D is symmetrized and contracted directly with the integral buffers;
+    grid points are processed in chunks bounded by gost.max_memory.
 """
 
 import numpy as np
@@ -61,23 +71,13 @@ def kernel(gost, dm):
     # contribute to the Hessian.
     inactive = (gost.amplitudes == 0.0)
 
-    # First derivatives of e_g and F_g
-    dg_trace, dF_trace = _compute_scalar_traces(gost, dm)
+    dm = _symmetrize(dm)
+    dA, d2A = _area_derivatives(gost)
+    first = _first_order_terms(gost, dm)
 
-    # Area derivatives (first and second)
-    if gost._outer_surface_dict is not None:
-        _, dareas_raw = get_dF_dA(gost._outer_surface_dict)
-        dA = dareas_raw.transpose(1, 2, 0) * gost._occ_ratio_sq
-        _, d2A = get_d2F_d2A(gost._outer_surface_dict)
-        d2A = d2A * gost._occ_ratio_sq
-    else:
-        _, dareas_raw = get_dF_dA(gost.surface_dict)
-        dA = dareas_raw.transpose(1, 2, 0)
-        _, d2A = get_d2F_d2A(gost.surface_dict)
-
-    # Second derivative traces
-    d2e = _compute_d2e(gost, dm)
-    d2F = _compute_d2F(gost, dm)
+    dg_trace, dF_trace = _compute_scalar_traces(gost, dm, first=first, dA=dA)
+    d2e = _compute_d2e(gost, dm, first=first, dA=dA, d2A=d2A)
+    d2F = _compute_d2F(gost, dm, first=first, dA=dA, d2A=d2A)
 
     # Assemble: E = P · Σ_g A·e/F → 10 terms from product rule
     inv_F = 1.0 / F_g
@@ -95,33 +95,22 @@ def kernel(gost, dm):
 
     hess = np.zeros((natm, natm, 3, 3))
     # H1: d²A · e/F
-    hess += P * np.einsum('ABxyg,g,g->ABxy', d2A, e_g, inv_F, optimize=True)
-    # H2: dA_Ax · de_By / F
-    hess += P * np.einsum('Axg,Byg,g->ABxy', dA, dg_trace, inv_F,
-                          optimize=True)
-    # H3: -dA_Ax · e · dF_By / F²
-    hess -= P * np.einsum('Axg,g,Byg,g->ABxy', dA, e_g, dF_trace, inv_F2,
-                          optimize=True)
-    # H4: dA_By · de_Ax / F
-    hess += P * np.einsum('Byg,Axg,g->ABxy', dA, dg_trace, inv_F,
-                          optimize=True)
+    hess += P * np.einsum('ABxyg,g->ABxy', d2A, e_g * inv_F)
+    # H2 + H4: dA_Ax · de_By / F + dA_By · de_Ax / F
+    hess += P * _outer_sum(dA, dg_trace * inv_F)
+    hess += P * _outer_sum(dg_trace, dA * inv_F)
+    # H3 + H7: -dA_Ax · e · dF_By / F² - dA_By · e · dF_Ax / F²
+    hess -= P * _outer_sum(dA, dF_trace * (e_g * inv_F2))
+    hess -= P * _outer_sum(dF_trace, dA * (e_g * inv_F2))
     # H5: A/F · d²e
-    hess += P * np.einsum('g,g,ABxyg->ABxy', A_g, inv_F, d2e, optimize=True)
-    # H6: -A/F² · de_Ax · dF_By
-    hess -= P * np.einsum('g,g,Axg,Byg->ABxy', A_g, inv_F2, dg_trace,
-                          dF_trace, optimize=True)
-    # H7: -dA_By · e · dF_Ax / F²
-    hess -= P * np.einsum('Byg,g,Axg,g->ABxy', dA, e_g, dF_trace, inv_F2,
-                          optimize=True)
-    # H8: -A/F² · de_By · dF_Ax
-    hess -= P * np.einsum('g,g,Byg,Axg->ABxy', A_g, inv_F2, dg_trace,
-                          dF_trace, optimize=True)
+    hess += P * np.einsum('ABxyg,g->ABxy', d2e, A_g * inv_F)
+    # H6 + H8: -A/F² · (de_Ax · dF_By + de_By · dF_Ax)
+    hess -= P * _outer_sum(dg_trace, dF_trace * (A_g * inv_F2))
+    hess -= P * _outer_sum(dF_trace, dg_trace * (A_g * inv_F2))
     # H9: -A·e/F² · d²F
-    hess -= P * np.einsum('g,g,g,ABxyg->ABxy', A_g, e_g, inv_F2, d2F,
-                          optimize=True)
+    hess -= P * np.einsum('ABxyg,g->ABxy', d2F, A_g * e_g * inv_F2)
     # H10: 2·A·e/F³ · dF_Ax · dF_By
-    hess += 2.0 * P * np.einsum('g,g,g,Axg,Byg->ABxy', A_g, e_g, inv_F3,
-                                dF_trace, dF_trace, optimize=True)
+    hess += 2.0 * P * _outer_sum(dF_trace, dF_trace * (A_g * e_g * inv_F3))
 
     hess = 0.5 * (hess + hess.transpose(1, 0, 3, 2))
 
@@ -136,10 +125,219 @@ def kernel(gost, dm):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _symmetrize(dm):
+    # All integral operators are symmetric in the AO pair, so only the
+    # symmetric part of D contributes to any trace.
+    dm = np.asarray(dm)
+    return 0.5 * (dm + dm.T)
+
+
+def _area_derivatives(gost):
+    """First and second area derivatives, (natm,3,ng) and (natm,natm,3,3,ng)."""
+    if gost._outer_surface_dict is not None:
+        surface, scale = gost._outer_surface_dict, gost._occ_ratio_sq
+    else:
+        surface, scale = gost.surface_dict, 1.0
+    _, dA = get_dF_dA(surface)
+    _, d2A = get_d2F_d2A(surface)
+    return dA.transpose(1, 2, 0) * scale, d2A * scale
+
+
+def _grid_chunks(gost, n_nao2_per_grid):
+    """Grid slices such that n_nao2_per_grid · nao² doubles per point fit in memory."""
+    nao = gost.mol.nao_nr()
+    max_memory = max(2000, gost.max_memory * 0.9 - lib.current_memory()[0])
+    blksize = max(1, int(max_memory * 1e6 / (8 * n_nao2_per_grid * nao**2)))
+    ngrids = gost.n_gaussian
+    for g0 in range(0, ngrids, blksize):
+        yield g0, min(g0 + blksize, ngrids)
+
+
+def _ao_to_atom(mol):
+    """(natm, nao) indicator matrix: U[A, i] = 1 if AO i sits on atom A."""
+    aoslice = mol.aoslice_by_atom()
+    U = np.zeros((mol.natm, mol.nao_nr()))
+    for A, (p0, p1) in enumerate(aoslice[:, 2:4]):
+        U[A, p0:p1] = 1.0
+    return U
+
+
+def _grid_to_atom(gost):
+    """(natm, ng) indicator matrix: O[A, g] = 1 if grid point g belongs to atom A."""
+    O = np.zeros((gost.mol.natm, gost.n_gaussian))
+    O[gost.atom_idx, np.arange(gost.n_gaussian)] = 1.0
+    return O
+
+
+def _int3c(mol, coords, widths, intor, comp, l=0, coeffs=None):
+    """(comp, nao, nao, naux) integrals with auxiliary Gaussians on the grid."""
+    gmol = fakemol_for_gaussian(coords, widths, l=l, coeffs=coeffs)
+    supermol = mol + gmol
+    shls_slice = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol.nbas)
+    return supermol.intor(intor, comp=comp, shls_slice=shls_slice)
+
+
+def _contract_dm(ints, dm):
+    """Σ_j D_ij ints[..., i, j, a] → (..., nao, naux).  D must be symmetric.
+
+    The integral buffers are Fortran-ordered in (i, j, a); writing D as D_ji
+    keeps both operands unit-stride along i, so no copies are made.
+    """
+    return np.einsum('...ija,ji->...ia', ints, dm)
+
+
+def _contract_normals(x, normals):
+    """Contract the trailing p-type auxiliary component with the normals."""
+    return np.einsum('...gc,gc->...g', x.reshape(x.shape[:-1] + (-1, 3)), normals)
+
+
+def _trace(ints, dm, normals=None):
+    """Tr[D · ints_a] for single-component integrals → (ng,)."""
+    t = np.einsum('ija,ji->a', ints, dm)
+    if normals is not None:
+        t = _contract_normals(t, normals)
+    return t
+
+
+def _deriv1(ints, dm, U, O, normals=None):
+    """Position derivative of Tr[D (ij|g)] at fixed width → (natm, 3, ng).
+
+    ints are ip1 integrals (3, nao, nao, naux).  With symmetric D the bra and
+    ket terms are equal, and the Gaussian-center term is fixed by translation
+    invariance (_project1).
+    """
+    s = _contract_dm(ints, dm)
+    if normals is not None:
+        s = _contract_normals(s, normals)
+    # ip1 = <∇i| = -∂/∂R_i; factor 2 for bra + ket
+    t = -2.0 * np.tensordot(U, s, axes=([1], [1]))
+    return _project1(t, O)
+
+
+def _deriv2(mol, coords, widths, dm, U, O, l=0, coeffs=None, normals=None):
+    """Position second derivative of Tr[D (ij|g)] at fixed width.
+
+    Returns (natm, natm, 3, 3, ng).  Only ipip1 (∂_i∂_i) and ipvip1 (∂_i∂_j)
+    are needed; Gaussian-center terms follow from _project2.
+    """
+    natm = mol.natm
+    aoslice = mol.aoslice_by_atom()
+
+    def reduce(ints, dm_part):
+        s = _contract_dm(ints, dm_part)
+        if normals is not None:
+            s = _contract_normals(s, normals)
+        return np.tensordot(U, s, axes=([1], [1]))   # (natm, 9, ng)
+
+    ints = _int3c(mol, coords, widths, 'int3c1e_ipip1', 9, l, coeffs)
+    ng = O.shape[1]
+    M = np.zeros((natm, natm, 9, ng))
+    M[np.arange(natm), np.arange(natm)] = reduce(ints, dm)
+    del ints
+
+    ints = _int3c(mol, coords, widths, 'int3c1e_ipvip1', 9, l, coeffs)
+    for B, (p0, p1) in enumerate(aoslice[:, 2:4]):
+        if p1 > p0:
+            M[:, B] += reduce(ints[:, :, p0:p1], dm[p0:p1])
+    del ints
+
+    # ipip1 = ∂_i∂_i, ipvip1 = ∂_i∂_j (two sign flips); factor 2 for i <-> j
+    M *= 2.0
+    return _project2(M, O).reshape(natm, natm, 3, 3, ng)
+
+
+def _project1(t, O):
+    """Add the Gaussian-center term: d/dR_A → t_A - δ_{A,K(g)} Σ_B t_B."""
+    return t - O[:, None, :] * t.sum(axis=0)
+
+
+def _project2(M, O):
+    """Second-derivative analogue of _project1 for M[A, B, comp, g]."""
+    rows = M.sum(axis=1)
+    cols = M.sum(axis=0)
+    total = rows.sum(axis=0)
+    return (M
+            - O[None, :, None, :] * rows[:, None]
+            - O[:, None, None, :] * cols[None, :]
+            + (O[:, None, None, :] * O[None, :, None, :]) * total)
+
+
+def _outer(a, b):
+    """a[A,x,g] · b[B,y,g] → (A, B, x, y, g)."""
+    return a[:, None, :, None, :] * b[None, :, None, :, :]
+
+
+def _outer_sum(a, b):
+    """Σ_g a[A,x,g] · b[B,y,g] → (A, B, x, y)."""
+    return np.einsum('Axg,Byg->ABxy', a, b)
+
+
+# ---------------------------------------------------------------------------
+# First-order quantities shared by traces, d²e and d²F
+# ---------------------------------------------------------------------------
+
+def _first_order_terms(gost, dm):
+    """Per-grid traces and their position derivatives (at fixed width).
+
+    Keys:
+      e_pos, F_pos   : ∂e/∂R, ∂F/∂R                          (natm, 3, ng)
+      r2_pos, fr2_pos: ∂/∂R of Tr[D r²G̃] and f_contracted     (natm, 3, ng)
+      r2, r4         : Tr[D r² G̃], Tr[D r⁴ G̃]                 (ng,)
+      fr2, fr4       : f_contracted, h5 (p-type r², r⁴ traces) (ng,)
+    """
+    mol = gost.mol
+    dm = _symmetrize(dm)
+    natm = mol.natm
+    ngrids = gost.n_gaussian
+    U = _ao_to_atom(mol)
+    O = _grid_to_atom(gost)
+
+    out = {k: np.zeros((natm, 3, ngrids))
+           for k in ('e_pos', 'F_pos', 'r2_pos', 'fr2_pos')}
+    out.update({k: np.zeros(ngrids) for k in ('r2', 'r4', 'fr2', 'fr4')})
+
+    # Largest live buffer: p-type ip1, 3 comps x 3 aux comps per grid point
+    for g0, g1 in _grid_chunks(gost, 9):
+        X = gost.grid_coords[g0:g1]
+        w = gost.widths[g0:g1]
+        n = gost.surface_normals[g0:g1]
+        Oc = O[:, g0:g1]
+        sl = slice(g0, g1)
+
+        # s-type: Gtilde and its r², r⁴ moments
+        out['e_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1', 3), dm, U, Oc)
+        out['r2_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3), dm, U, Oc)
+        out['r2'][sl] = _trace(_int3c(mol, X, w, 'int3c1e_r2_origk', 1), dm)
+        out['r4'][sl] = _trace(_int3c(mol, X, w, 'int3c1e_r4_origk', 1), dm)
+
+        # p-type: Fhat (coeff 2ω) and its width moments
+        out['F_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1', 3, l=1, coeffs=2.0 * w),
+            dm, U, Oc, normals=n)
+        # ∂Fhat/∂ω = Fhat/ω + f_contracted, with f = -2ω · r² p-type
+        out['fr2_pos'][..., sl] = _deriv1(
+            _int3c(mol, X, w, 'int3c1e_ip1_r2_origk', 3, l=1, coeffs=-2.0 * w),
+            dm, U, Oc, normals=n)
+        out['fr2'][sl] = _trace(
+            _int3c(mol, X, w, 'int3c1e_r2_origk', 1, l=1, coeffs=-2.0 * w),
+            dm, normals=n)
+        # ∂²Fhat/∂ω² = 2 f_contracted/ω + h5, with h5 = 2ω · r⁴ p-type
+        out['fr4'][sl] = _trace(
+            _int3c(mol, X, w, 'int3c1e_r4_origk', 1, l=1, coeffs=2.0 * w),
+            dm, normals=n)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # First derivatives of scalar traces
 # ---------------------------------------------------------------------------
 
-def _compute_scalar_traces(gost, dm):
+def _compute_scalar_traces(gost, dm, first=None, dA=None):
     """Compute de_g/dR_Ax and dF_g/dR_Ax for all atoms.
 
     Returns
@@ -147,116 +345,17 @@ def _compute_scalar_traces(gost, dm):
     dg_trace : ndarray (natm, 3, ngrids)
     dF_trace : ndarray (natm, 3, ngrids)
     """
-    mol = gost.mol
-    nao_cart = mol.nao_nr(cart=True)
-    natm = mol.natm
-    ngrids = gost.n_gaussian
-    aoslice = mol.aoslice_by_atom()
-    widths = gost.widths
-    areas = gost.areas
-    normals = gost.surface_normals
+    if first is None:
+        first = _first_order_terms(gost, dm)
+    if dA is None:
+        dA = _area_derivatives(gost)[0]
+    wgrad_prefs = -np.pi * np.log(2) / (gost.areas ** 2)  # dω/dA
 
-    if not mol.cart:
-        c2s = mol.cart2sph_coeff(normalized='sp')
-
-    # Area derivatives
-    if gost._outer_surface_dict is not None:
-        _, dareas = get_dF_dA(gost._outer_surface_dict)
-        dareas = dareas.transpose(1, 2, 0) * gost._occ_ratio_sq
-    else:
-        _, dareas = get_dF_dA(gost.surface_dict)
-        dareas = dareas.transpose(1, 2, 0)
-
-    wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)  # dω/dA
-
-    # --- de_g/dR: s-type (Gtilde trace) ---
-    gmol_s = fakemol_for_gaussian(gost.grid_coords, widths)
-    supermol_s = mol + gmol_s
-    nao = mol.nao_nr()
-    slices_s = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_s.nbas)
-    slices_sg = (mol.nbas, mol.nbas + gmol_s.nbas, 0, mol.nbas, 0, mol.nbas)
-
-    dPQ_s = supermol_s.intor('int3c1e_ip1', shls_slice=slices_s)
-    dG_s = supermol_s.intor('int3c1e_ip1', shls_slice=slices_sg)
-
-    dg_trace = np.zeros((natm, 3, ngrids))
-    dPQ_s_dm = np.einsum('xijg,ij->xig', dPQ_s, dm, optimize=True)
-    dPQ_s_dm += np.einsum('xijg,ji->xig', dPQ_s, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        dg_trace[A] -= np.sum(dPQ_s_dm[:, p0:p1, :], axis=1)
-    dG_s_dm = np.einsum('xgij,ij->xg', dG_s, dm, optimize=True)
-    for g in range(ngrids):
-        dg_trace[gost.atom_idx[g], :, g] -= dG_s_dm[:, g]
-    del dPQ_s, dG_s, dPQ_s_dm, dG_s_dm
-
-    # Width contribution to de: dω/dR · Tr[D · ∂G/∂ω] = wgp·dA·(-diagd_dm)
-    gmol_d = fakemol_for_gaussian(gost.grid_coords, widths, l=2)
-    supermol_d = mol + gmol_d
-    supermol_d.cart = True
-    slices_d = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d.nbas)
-    overlap3d = supermol_d.intor('int3c1e', shls_slice=slices_d
-                                 ).reshape(nao_cart, nao_cart, ngrids, 6)
-    if not mol.cart:
-        overlap3d = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s,
-                              optimize=True)
-    diagd = overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3] + overlap3d[:, :, :, 5]
-    diagd_dm = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
-    dg_trace -= np.einsum('axg,g->axg', dareas, wgrad_prefs * diagd_dm,
-                          optimize=True)
-    del overlap3d, diagd
-
-    # --- dF_g/dR: p-type (Fhat trace) ---
-    gmol_p = fakemol_for_gaussian(gost.grid_coords, widths, l=1,
-                                  coeffs=2.0 * widths)
-    supermol_p = mol + gmol_p
-    slices_p = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p.nbas)
-    slices_pg = (mol.nbas, mol.nbas + gmol_p.nbas, 0, mol.nbas, 0, mol.nbas)
-
-    dPQ_p_raw = supermol_p.intor('int3c1e_ip1', shls_slice=slices_p
-                                 ).reshape(3, nao, nao, ngrids, 3)
-    dPQ_p = np.einsum('xijgc,gc->xijg', dPQ_p_raw, normals, optimize=True)
-    dG_p_raw = supermol_p.intor('int3c1e_ip1', shls_slice=slices_pg
-                                ).reshape(3, ngrids, 3, nao, nao)
-    dG_p = np.einsum('xgcij,gc->xgij', dG_p_raw, normals, optimize=True)
-    del dPQ_p_raw, dG_p_raw
-
-    dF_trace = np.zeros((natm, 3, ngrids))
-    dPQ_p_dm = np.einsum('xijg,ij->xig', dPQ_p, dm, optimize=True)
-    dPQ_p_dm += np.einsum('xijg,ji->xig', dPQ_p, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        dF_trace[A] -= np.sum(dPQ_p_dm[:, p0:p1, :], axis=1)
-    dG_p_dm = np.einsum('xgij,ij->xg', dG_p, dm, optimize=True)
-    for g in range(ngrids):
-        dF_trace[gost.atom_idx[g], :, g] -= dG_p_dm[:, g]
-    del dPQ_p, dG_p, dPQ_p_dm, dG_p_dm
-
-    # Width contribution to dF: dω/dR · Tr[D · ∂F/∂ω]
-    # ∂F/∂ω = F/ω + f_contracted (l=3 Laplacian-traced, normal-contracted)
-    gmol_f = fakemol_for_gaussian(gost.grid_coords, widths, l=3,
-                                  coeffs=-2.0 * widths)
-    supermol_f = mol + gmol_f
-    supermol_f.cart = True
-    slices_f = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_f.nbas)
-    overlap3f = supermol_f.intor('int3c1e', shls_slice=slices_f
-                                 ).reshape(nao_cart, nao_cart, ngrids, 10)
-    if not mol.cart:
-        overlap3f = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s,
-                              optimize=True)
-    fx = overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3] + overlap3f[:, :, :, 5]
-    fy = overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6] + overlap3f[:, :, :, 8]
-    fz = overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7] + overlap3f[:, :, :, 9]
-    f_contracted_dm = (
-        np.einsum('ijg,ij->g', fx, dm, optimize=True) * normals[:, 0]
-        + np.einsum('ijg,ij->g', fy, dm, optimize=True) * normals[:, 1]
-        + np.einsum('ijg,ij->g', fz, dm, optimize=True) * normals[:, 2]
-    )
-    dFhat_domega_trace = gost.forces / widths + f_contracted_dm
-    dF_trace += np.einsum('axg,g->axg', dareas,
-                          wgrad_prefs * dFhat_domega_trace, optimize=True)
-    del overlap3f, fx, fy, fz
-
+    # Width contribution: dω/dR · ∂e/∂ω with ∂e/∂ω = -Tr[D r² G̃]
+    dg_trace = first['e_pos'] - dA * (wgrad_prefs * first['r2'])
+    # Width contribution: dω/dR · ∂F/∂ω with ∂F/∂ω = F/ω + f_contracted
+    dFhat_domega = gost.forces / gost.widths + first['fr2']
+    dF_trace = first['F_pos'] + dA * (wgrad_prefs * dFhat_domega)
     return dg_trace, dF_trace
 
 
@@ -264,189 +363,40 @@ def _compute_scalar_traces(gost, dm):
 # d²e_g/(dR_Ax dR_By) — second derivative of Gtilde trace
 # ---------------------------------------------------------------------------
 
-def _compute_d2e(gost, dm):
+def _compute_d2e(gost, dm, first=None, dA=None, d2A=None):
     """Compute d²e_g/(dR_Ax dR_By) analytically.
 
     Returns shape (natm, natm, 3, 3, ngrids).
     """
     mol = gost.mol
-    nao = mol.nao_nr()
-    nao_cart = mol.nao_nr(cart=True)
-    natm = mol.natm
-    ngrids = gost.n_gaussian
-    aoslice = mol.aoslice_by_atom()
-    widths = gost.widths
+    dm = _symmetrize(dm)
+    if first is None:
+        first = _first_order_terms(gost, dm)
+    if dA is None or d2A is None:
+        dA, d2A = _area_derivatives(gost)
     areas = gost.areas
     wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
-
-    if not mol.cart:
-        c2s = mol.cart2sph_coeff(normalized='sp')
-
-    # Area derivatives
-    if gost._outer_surface_dict is not None:
-        _, dareas_raw = get_dF_dA(gost._outer_surface_dict)
-        dareas = dareas_raw.transpose(1, 2, 0) * gost._occ_ratio_sq
-        _, d2A = get_d2F_d2A(gost._outer_surface_dict)
-        d2A = d2A * gost._occ_ratio_sq
-    else:
-        _, dareas_raw = get_dF_dA(gost.surface_dict)
-        dareas = dareas_raw.transpose(1, 2, 0)
-        _, d2A = get_d2F_d2A(gost.surface_dict)
-
-    d2e = np.zeros((natm, natm, 3, 3, ngrids))
+    U = _ao_to_atom(mol)
+    O = _grid_to_atom(gost)
 
     # === G1: Position × Position ===
-    gmol_s = fakemol_for_gaussian(gost.grid_coords, widths)
-    supermol = mol + gmol_s
-    slices_s = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_s.nbas)
-
-    # ipip1: ∂²/∂R_bra² (diagonal A=B)
-    ipip1 = supermol.intor('int3c1e_ipip1', shls_slice=slices_s)
-    ipip1_dm = np.einsum('xijg,ij->xig', ipip1, dm, optimize=True)
-    ipip1_dm += np.einsum('xijg,ji->xig', ipip1, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        d2e[A, A] += np.sum(ipip1_dm[:, p0:p1, :], axis=1).reshape(3, 3, ngrids)
-    del ipip1, ipip1_dm
-
-    # ipvip1: ∂²/(∂R_bra ∂R_ket)
-    ipvip1 = supermol.intor('int3c1e_ipvip1', shls_slice=slices_s)
-    for A in range(natm):
-        p0_A, p1_A = aoslice[A, 2], aoslice[A, 3]
-        for B in range(natm):
-            p0_B, p1_B = aoslice[B, 2], aoslice[B, 3]
-            block = ipvip1[:, p0_A:p1_A, p0_B:p1_B, :]
-            trace_block = (
-                np.einsum('xijg,ij->xg', block,
-                          dm[p0_A:p1_A, p0_B:p1_B], optimize=True)
-                + np.einsum('xijg,ji->xg', block,
-                            dm[p0_B:p1_B, p0_A:p1_A], optimize=True))
-            d2e[A, B] += trace_block.reshape(3, 3, ngrids)
-    del ipvip1
-
-    # ip1ip2: ∂²/(∂R_bra ∂R_aux)
-    ip1ip2 = supermol.intor('int3c1e_ip1ip2', shls_slice=slices_s)
-    ip1ip2_dm = np.einsum('xijg,ij->xig', ip1ip2, dm, optimize=True)
-    ip1ip2_dm += np.einsum('xijg,ji->xig', ip1ip2, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        contrib_A = np.sum(ip1ip2_dm[:, p0:p1, :], axis=1)
-        for g in range(ngrids):
-            B = gost.atom_idx[g]
-            d2e[A, B, :, :, g] += contrib_A[:, g].reshape(3, 3)
-    # Reverse: aux × bra/ket
-    for g in range(ngrids):
-        A = gost.atom_idx[g]
-        for B in range(natm):
-            p0, p1 = aoslice[B, 2], aoslice[B, 3]
-            trace_ig = np.sum(ip1ip2_dm[:, p0:p1, g], axis=1)
-            d2e[A, B, :, :, g] += trace_ig.reshape(3, 3).T
-    del ip1ip2, ip1ip2_dm
-
-    # ipip2: ∂²/∂R_aux² (diagonal)
-    ipip2 = supermol.intor('int3c1e_ipip2', shls_slice=slices_s)
-    ipip2_dm = np.einsum('xijg,ij->xg', ipip2, dm, optimize=True)
-    for g in range(ngrids):
-        B = gost.atom_idx[g]
-        d2e[B, B, :, :, g] += ipip2_dm[:, g].reshape(3, 3)
-    del ipip2, ipip2_dm
+    d2e = np.empty((mol.natm, mol.natm, 3, 3, gost.n_gaussian))
+    for g0, g1 in _grid_chunks(gost, 9):
+        d2e[..., g0:g1] = _deriv2(mol, gost.grid_coords[g0:g1],
+                                  gost.widths[g0:g1], dm, U, O[:, g0:g1])
 
     # === G2+G3: Position × Width cross terms ===
-    gmol_d = fakemol_for_gaussian(gost.grid_coords, widths, l=2)
-    supermol_d = mol + gmol_d
-    supermol_d.cart = True
-    slices_d = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d.nbas)
-    slices_dg = (mol.nbas, mol.nbas + gmol_d.nbas, 0, mol.nbas, 0, mol.nbas)
+    # ∂²e/(∂pos ∂ω) = -∂(Tr[D r² G̃])/∂pos
+    wdA = -wgrad_prefs * dA
+    d2e += _outer(first['r2_pos'], wdA) + _outer(wdA, first['r2_pos'])
 
-    # ip1 of d-type (bra derivative)
-    ip1_d_bra = supermol_d.intor('int3c1e_ip1', shls_slice=slices_d
-                                  ).reshape(3, nao_cart, nao_cart, ngrids, 6)
-    ip1_diagd_bra = (ip1_d_bra[:, :, :, :, 0] + ip1_d_bra[:, :, :, :, 3]
-                     + ip1_d_bra[:, :, :, :, 5])
-    del ip1_d_bra
-    if not mol.cart:
-        ip1_diagd_bra = np.einsum('mi,xijg,jn->xmng', c2s.T,
-                                  ip1_diagd_bra, c2s, optimize=True)
-    ip1_diagd_dm_bra = np.einsum('xijg,ij->xig', ip1_diagd_bra, dm,
-                                 optimize=True)
-    ip1_diagd_dm_bra += np.einsum('xijg,ji->xig', ip1_diagd_bra, dm,
-                                  optimize=True)
-    del ip1_diagd_bra
+    # === G4: d²ω · ∂e/∂ω, ∂e/∂ω = -r2 ===
+    # d²ω = -2·wgp/A · dA dA + wgp · d²A
+    d2e += _outer(dA, dA * (2.0 * wgrad_prefs / areas * first['r2']))
+    d2e -= d2A * (wgrad_prefs * first['r2'])
 
-    d_diagd_dm_pos = np.zeros((natm, 3, ngrids))
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        d_diagd_dm_pos[A] -= np.sum(ip1_diagd_dm_bra[:, p0:p1, :], axis=1)
-    del ip1_diagd_dm_bra
-
-    # ip1 of d-type (aux derivative)
-    ip1_d_aux = supermol_d.intor('int3c1e_ip1', shls_slice=slices_dg
-                                  ).reshape(3, ngrids, 6, nao_cart, nao_cart)
-    ip1_diagd_aux = (ip1_d_aux[:, :, 0, :, :] + ip1_d_aux[:, :, 3, :, :]
-                     + ip1_d_aux[:, :, 5, :, :])
-    del ip1_d_aux
-    if not mol.cart:
-        ip1_diagd_aux = np.einsum('mi,xgij,jn->xgmn', c2s.T,
-                                  ip1_diagd_aux, c2s, optimize=True)
-    ip1_diagd_dm_aux = np.einsum('xgij,ij->xg', ip1_diagd_aux, dm,
-                                 optimize=True)
-    del ip1_diagd_aux
-    for g in range(ngrids):
-        d_diagd_dm_pos[gost.atom_idx[g], :, g] -= ip1_diagd_dm_aux[:, g]
-    del ip1_diagd_dm_aux
-
-    # G2 + G3: ∂²e/(∂pos ∂ω) = -∂diagd/∂pos → cross = -wgp·dA·d_diagd_dm_pos
-    d2e += np.einsum('g,Byg,Axg->ABxyg', -wgrad_prefs, dareas,
-                     d_diagd_dm_pos, optimize=True)
-    d2e += np.einsum('g,Axg,Byg->ABxyg', -wgrad_prefs, dareas,
-                     d_diagd_dm_pos, optimize=True)
-
-    # === G4+G5: Width × Width terms ===
-    # G4: d²ω · ∂e/∂ω = d²ω · (-diagd_dm)
-    gmol_d2 = fakemol_for_gaussian(gost.grid_coords, widths, l=2)
-    supermol_d2 = mol + gmol_d2
-    supermol_d2.cart = True
-    slices_d2 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_d2.nbas)
-    overlap3d = supermol_d2.intor('int3c1e', shls_slice=slices_d2
-                                  ).reshape(nao_cart, nao_cart, ngrids, 6)
-    if not mol.cart:
-        overlap3d = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3d, c2s,
-                              optimize=True)
-    diagd = overlap3d[:, :, :, 0] + overlap3d[:, :, :, 3] + overlap3d[:, :, :, 5]
-    diagd_dm = np.einsum('ijg,ij->g', diagd, dm, optimize=True)
-    del overlap3d, diagd
-
-    # G4a: (-2·wgp/A · dA_Ax · dA_By) · (-diagd_dm)
-    d2e += np.einsum('g,Axg,Byg,g->ABxyg',
-                     2.0 * wgrad_prefs / areas, dareas, dareas, diagd_dm,
-                     optimize=True)
-    # G4b: (wgp · d²A) · (-diagd_dm)
-    d2e -= np.einsum('g,ABxyg,g->ABxyg', wgrad_prefs, d2A, diagd_dm,
-                     optimize=True)
-
-    # G5: dω_Ax · dω_By · ∂²e/∂ω² (l=4 g-type)
-    gmol_g4 = fakemol_for_gaussian(gost.grid_coords, widths, l=4)
-    supermol_g4 = mol + gmol_g4
-    supermol_g4.cart = True
-    slices_g4 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_g4.nbas)
-    overlap3g = supermol_g4.intor('int3c1e', shls_slice=slices_g4
-                                  ).reshape(nao_cart, nao_cart, ngrids, 15)
-    if not mol.cart:
-        overlap3g = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3g, c2s,
-                              optimize=True)
-    # (r²)² = x⁴+y⁴+z⁴+2x²y²+2x²z²+2y²z²
-    gtype_trace = (overlap3g[:, :, :, 0] + overlap3g[:, :, :, 10]
-                   + overlap3g[:, :, :, 14]
-                   + 2.0 * overlap3g[:, :, :, 3]
-                   + 2.0 * overlap3g[:, :, :, 5]
-                   + 2.0 * overlap3g[:, :, :, 12])
-    gtype_dm = np.einsum('ijg,ij->g', gtype_trace, dm, optimize=True)
-    del overlap3g, gtype_trace
-
-    d2e += np.einsum('g,Axg,g,Byg,g->ABxyg',
-                     wgrad_prefs, dareas, wgrad_prefs, dareas, gtype_dm,
-                     optimize=True)
-
+    # === G5: dω_Ax · dω_By · ∂²e/∂ω², ∂²e/∂ω² = r4 ===
+    d2e += _outer(wgrad_prefs * dA, wgrad_prefs * dA * first['r4'])
     return d2e
 
 
@@ -454,266 +404,45 @@ def _compute_d2e(gost, dm):
 # d²F_g/(dR_Ax dR_By) — second derivative of Fhat (force) trace
 # ---------------------------------------------------------------------------
 
-def _compute_d2F(gost, dm):
+def _compute_d2F(gost, dm, first=None, dA=None, d2A=None):
     """Compute d²F_g/(dR_Ax dR_By) analytically.
 
     Returns shape (natm, natm, 3, 3, ngrids).
     """
     mol = gost.mol
-    nao = mol.nao_nr()
-    nao_cart = mol.nao_nr(cart=True)
-    natm = mol.natm
-    ngrids = gost.n_gaussian
-    aoslice = mol.aoslice_by_atom()
-    widths = gost.widths
+    dm = _symmetrize(dm)
+    if first is None:
+        first = _first_order_terms(gost, dm)
+    if dA is None or d2A is None:
+        dA, d2A = _area_derivatives(gost)
     areas = gost.areas
-    normals = gost.surface_normals
+    widths = gost.widths
     forces = gost.forces
     wgrad_prefs = -np.pi * np.log(2) / (areas ** 2)
-
-    if not mol.cart:
-        c2s = mol.cart2sph_coeff(normalized='sp')
-
-    # Area derivatives
-    if gost._outer_surface_dict is not None:
-        _, dareas_raw = get_dF_dA(gost._outer_surface_dict)
-        dareas = dareas_raw.transpose(1, 2, 0) * gost._occ_ratio_sq
-        _, d2A = get_d2F_d2A(gost._outer_surface_dict)
-        d2A = d2A * gost._occ_ratio_sq
-    else:
-        _, dareas_raw = get_dF_dA(gost.surface_dict)
-        dareas = dareas_raw.transpose(1, 2, 0)
-        _, d2A = get_d2F_d2A(gost.surface_dict)
-
-    d2F = np.zeros((natm, natm, 3, 3, ngrids))
+    U = _ao_to_atom(mol)
+    O = _grid_to_atom(gost)
 
     # === G1: Position × Position (p-type + normals) ===
-    gmol_p = fakemol_for_gaussian(gost.grid_coords, widths, l=1,
-                                  coeffs=2.0 * widths)
-    supermol = mol + gmol_p
-    slices_p = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_p.nbas)
-
-    # ipip1
-    ipip1_raw = supermol.intor('int3c1e_ipip1', shls_slice=slices_p
-                               ).reshape(9, nao, nao, ngrids, 3)
-    ipip1 = np.einsum('xijgc,gc->xijg', ipip1_raw, normals, optimize=True)
-    del ipip1_raw
-    ipip1_dm = np.einsum('xijg,ij->xig', ipip1, dm, optimize=True)
-    ipip1_dm += np.einsum('xijg,ji->xig', ipip1, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        d2F[A, A] += np.sum(ipip1_dm[:, p0:p1, :], axis=1).reshape(3, 3, ngrids)
-    del ipip1, ipip1_dm
-
-    # ipvip1
-    ipvip1_raw = supermol.intor('int3c1e_ipvip1', shls_slice=slices_p
-                                ).reshape(9, nao, nao, ngrids, 3)
-    ipvip1 = np.einsum('xijgc,gc->xijg', ipvip1_raw, normals, optimize=True)
-    del ipvip1_raw
-    for A in range(natm):
-        p0_A, p1_A = aoslice[A, 2], aoslice[A, 3]
-        for B in range(natm):
-            p0_B, p1_B = aoslice[B, 2], aoslice[B, 3]
-            block = ipvip1[:, p0_A:p1_A, p0_B:p1_B, :]
-            trace_block = (
-                np.einsum('xijg,ij->xg', block,
-                          dm[p0_A:p1_A, p0_B:p1_B], optimize=True)
-                + np.einsum('xijg,ji->xg', block,
-                            dm[p0_B:p1_B, p0_A:p1_A], optimize=True))
-            d2F[A, B] += trace_block.reshape(3, 3, ngrids)
-    del ipvip1
-
-    # ip1ip2
-    ip1ip2_raw = supermol.intor('int3c1e_ip1ip2', shls_slice=slices_p
-                                ).reshape(9, nao, nao, ngrids, 3)
-    ip1ip2 = np.einsum('xijgc,gc->xijg', ip1ip2_raw, normals, optimize=True)
-    del ip1ip2_raw
-    ip1ip2_dm = np.einsum('xijg,ij->xig', ip1ip2, dm, optimize=True)
-    ip1ip2_dm += np.einsum('xijg,ji->xig', ip1ip2, dm, optimize=True)
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        contrib_A = np.sum(ip1ip2_dm[:, p0:p1, :], axis=1)
-        for g in range(ngrids):
-            B = gost.atom_idx[g]
-            d2F[A, B, :, :, g] += contrib_A[:, g].reshape(3, 3)
-    for g in range(ngrids):
-        A = gost.atom_idx[g]
-        for B in range(natm):
-            p0, p1 = aoslice[B, 2], aoslice[B, 3]
-            trace_ig = np.sum(ip1ip2_dm[:, p0:p1, g], axis=1)
-            d2F[A, B, :, :, g] += trace_ig.reshape(3, 3).T
-    del ip1ip2, ip1ip2_dm
-
-    # ipip2
-    ipip2_raw = supermol.intor('int3c1e_ipip2', shls_slice=slices_p
-                               ).reshape(9, nao, nao, ngrids, 3)
-    ipip2 = np.einsum('xijgc,gc->xijg', ipip2_raw, normals, optimize=True)
-    del ipip2_raw
-    ipip2_dm = np.einsum('xijg,ij->xg', ipip2, dm, optimize=True)
-    for g in range(ngrids):
-        B = gost.atom_idx[g]
-        d2F[B, B, :, :, g] += ipip2_dm[:, g].reshape(3, 3)
-    del ipip2, ipip2_dm
+    d2F = np.empty((mol.natm, mol.natm, 3, 3, gost.n_gaussian))
+    for g0, g1 in _grid_chunks(gost, 27):
+        w = widths[g0:g1]
+        d2F[..., g0:g1] = _deriv2(mol, gost.grid_coords[g0:g1], w, dm, U,
+                                  O[:, g0:g1], l=1, coeffs=2.0 * w,
+                                  normals=gost.surface_normals[g0:g1])
 
     # === G2+G3: Position × Width cross terms ===
-    # ∂²F/(∂pos_Ax ∂ω) = (1/ω)·dF_pos[A,x] + d_f_dm_pos[A,x]
-    slices_pg = (mol.nbas, mol.nbas + gmol_p.nbas,
-                 0, mol.nbas, 0, mol.nbas)
-
-    # dF_pos: position-only part of dF/dR (p-type ip1)
-    ip1_p_bra_raw = supermol.intor('int3c1e_ip1', shls_slice=slices_p
-                                   ).reshape(3, nao, nao, ngrids, 3)
-    ip1_p_bra = np.einsum('xijgc,gc->xijg', ip1_p_bra_raw, normals,
-                          optimize=True)
-    del ip1_p_bra_raw
-    ip1_p_bra_dm = np.einsum('xijg,ij->xig', ip1_p_bra, dm, optimize=True)
-    ip1_p_bra_dm += np.einsum('xijg,ji->xig', ip1_p_bra, dm, optimize=True)
-    del ip1_p_bra
-
-    ip1_p_aux_raw = supermol.intor('int3c1e_ip1', shls_slice=slices_pg
-                                   ).reshape(3, ngrids, 3, nao, nao)
-    ip1_p_aux = np.einsum('xgcij,gc->xgij', ip1_p_aux_raw, normals,
-                          optimize=True)
-    del ip1_p_aux_raw
-    ip1_p_aux_dm = np.einsum('xgij,ij->xg', ip1_p_aux, dm, optimize=True)
-    del ip1_p_aux
-
-    dF_pos = np.zeros((natm, 3, ngrids))
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        dF_pos[A] -= np.sum(ip1_p_bra_dm[:, p0:p1, :], axis=1)
-    for g in range(ngrids):
-        dF_pos[gost.atom_idx[g], :, g] -= ip1_p_aux_dm[:, g]
-    del ip1_p_bra_dm, ip1_p_aux_dm
-
-    # d_f_dm_pos: position derivative of f_contracted_dm (l=3)
-    gmol_f = fakemol_for_gaussian(gost.grid_coords, widths, l=3,
-                                  coeffs=-2.0 * widths)
-    supermol_f = mol + gmol_f
-    supermol_f.cart = True
-    slices_f = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_f.nbas)
-    slices_fg = (mol.nbas, mol.nbas + gmol_f.nbas, 0, mol.nbas, 0, mol.nbas)
-
-    ip1_f_bra = supermol_f.intor('int3c1e_ip1', shls_slice=slices_f
-                                 ).reshape(3, nao_cart, nao_cart, ngrids, 10)
-    ip1_fx = (ip1_f_bra[:, :, :, :, 0] + ip1_f_bra[:, :, :, :, 3]
-              + ip1_f_bra[:, :, :, :, 5])
-    ip1_fy = (ip1_f_bra[:, :, :, :, 1] + ip1_f_bra[:, :, :, :, 6]
-              + ip1_f_bra[:, :, :, :, 8])
-    ip1_fz = (ip1_f_bra[:, :, :, :, 2] + ip1_f_bra[:, :, :, :, 7]
-              + ip1_f_bra[:, :, :, :, 9])
-    del ip1_f_bra
-    ip1_f_contracted_bra = (ip1_fx * normals[:, 0] + ip1_fy * normals[:, 1]
-                            + ip1_fz * normals[:, 2])
-    del ip1_fx, ip1_fy, ip1_fz
-    if not mol.cart:
-        ip1_f_contracted_bra = np.einsum('mi,xijg,jn->xmng', c2s.T,
-                                         ip1_f_contracted_bra, c2s,
-                                         optimize=True)
-    ip1_f_dm_bra = np.einsum('xijg,ij->xig', ip1_f_contracted_bra, dm,
-                             optimize=True)
-    ip1_f_dm_bra += np.einsum('xijg,ji->xig', ip1_f_contracted_bra, dm,
-                              optimize=True)
-    del ip1_f_contracted_bra
-
-    ip1_f_aux = supermol_f.intor('int3c1e_ip1', shls_slice=slices_fg
-                                 ).reshape(3, ngrids, 10, nao_cart, nao_cart)
-    ip1_fx_aux = (ip1_f_aux[:, :, 0, :, :] + ip1_f_aux[:, :, 3, :, :]
-                  + ip1_f_aux[:, :, 5, :, :])
-    ip1_fy_aux = (ip1_f_aux[:, :, 1, :, :] + ip1_f_aux[:, :, 6, :, :]
-                  + ip1_f_aux[:, :, 8, :, :])
-    ip1_fz_aux = (ip1_f_aux[:, :, 2, :, :] + ip1_f_aux[:, :, 7, :, :]
-                  + ip1_f_aux[:, :, 9, :, :])
-    del ip1_f_aux
-    ip1_f_contracted_aux = (ip1_fx_aux * normals[:, 0][:, None, None]
-                            + ip1_fy_aux * normals[:, 1][:, None, None]
-                            + ip1_fz_aux * normals[:, 2][:, None, None])
-    del ip1_fx_aux, ip1_fy_aux, ip1_fz_aux
-    if not mol.cart:
-        ip1_f_contracted_aux = np.einsum('mi,xgij,jn->xgmn', c2s.T,
-                                         ip1_f_contracted_aux, c2s,
-                                         optimize=True)
-    ip1_f_dm_aux = np.einsum('xgij,ij->xg', ip1_f_contracted_aux, dm,
-                             optimize=True)
-    del ip1_f_contracted_aux
-
-    d_f_dm_pos = np.zeros((natm, 3, ngrids))
-    for A in range(natm):
-        p0, p1 = aoslice[A, 2], aoslice[A, 3]
-        d_f_dm_pos[A] -= np.sum(ip1_f_dm_bra[:, p0:p1, :], axis=1)
-    for g in range(ngrids):
-        d_f_dm_pos[gost.atom_idx[g], :, g] -= ip1_f_dm_aux[:, g]
-    del ip1_f_dm_bra, ip1_f_dm_aux
-
-    # Combined cross-term scalar
-    d_dFhat_domega_dm_pos = dF_pos / widths + d_f_dm_pos
-
-    # G2 + G3
-    d2F += np.einsum('g,Byg,Axg->ABxyg', wgrad_prefs, dareas,
-                     d_dFhat_domega_dm_pos, optimize=True)
-    d2F += np.einsum('g,Axg,Byg->ABxyg', wgrad_prefs, dareas,
-                     d_dFhat_domega_dm_pos, optimize=True)
+    # ∂²F/(∂pos_Ax ∂ω) = (1/ω)·∂F/∂pos + ∂f_contracted/∂pos
+    d_dFhat_domega_pos = first['F_pos'] / widths + first['fr2_pos']
+    wdA = wgrad_prefs * dA
+    d2F += _outer(d_dFhat_domega_pos, wdA) + _outer(wdA, d_dFhat_domega_pos)
 
     # === G4: d²ω · ∂F/∂ω ===
-    # f_contracted_dm from l=3 overlap
-    overlap3f = supermol_f.intor('int3c1e', shls_slice=slices_f
-                                 ).reshape(nao_cart, nao_cart, ngrids, 10)
-    if not mol.cart:
-        overlap3f = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3f, c2s,
-                              optimize=True)
-    fx = overlap3f[:, :, :, 0] + overlap3f[:, :, :, 3] + overlap3f[:, :, :, 5]
-    fy = overlap3f[:, :, :, 1] + overlap3f[:, :, :, 6] + overlap3f[:, :, :, 8]
-    fz = overlap3f[:, :, :, 2] + overlap3f[:, :, :, 7] + overlap3f[:, :, :, 9]
-    f_contracted_dm = (
-        np.einsum('ijg,ij->g', fx, dm, optimize=True) * normals[:, 0]
-        + np.einsum('ijg,ij->g', fy, dm, optimize=True) * normals[:, 1]
-        + np.einsum('ijg,ij->g', fz, dm, optimize=True) * normals[:, 2]
-    )
-    del overlap3f, fx, fy, fz
-
-    dFhat_domega_trace = forces / widths + f_contracted_dm
-
-    # G4a: (-2·wgp/A · dA_Ax · dA_By) · dFhat_domega_trace
-    d2F += np.einsum('g,Axg,Byg,g->ABxyg',
-                     -2.0 * wgrad_prefs / areas, dareas, dareas,
-                     dFhat_domega_trace, optimize=True)
-    # G4b: wgp · d²A · dFhat_domega_trace
-    d2F += np.einsum('g,ABxyg,g->ABxyg', wgrad_prefs, d2A,
-                     dFhat_domega_trace, optimize=True)
+    dFhat_domega = forces / widths + first['fr2']
+    d2F += _outer(dA, dA * (-2.0 * wgrad_prefs / areas * dFhat_domega))
+    d2F += d2A * (wgrad_prefs * dFhat_domega)
 
     # === G5: dω_Ax · dω_By · ∂²F/∂ω² ===
-    # ∂²F/∂ω² = (2/ω)·f_contracted_dm + h5_dm (l=5)
-    gmol_h5 = fakemol_for_gaussian(gost.grid_coords, widths, l=5,
-                                   coeffs=2.0 * widths)
-    supermol_h5 = mol + gmol_h5
-    supermol_h5.cart = True
-    slices_h5 = (0, mol.nbas, 0, mol.nbas, mol.nbas, mol.nbas + gmol_h5.nbas)
-    overlap3h = supermol_h5.intor('int3c1e', shls_slice=slices_h5
-                                  ).reshape(nao_cart, nao_cart, ngrids, 21)
-    if not mol.cart:
-        overlap3h = np.einsum('ij,jkgd,kl->ilgd', c2s.T, overlap3h, c2s,
-                              optimize=True)
-    # r_c · r⁴ contracted with normals
-    h5x = (overlap3h[:, :, :, 0] + 2*overlap3h[:, :, :, 3]
-            + 2*overlap3h[:, :, :, 5] + overlap3h[:, :, :, 10]
-            + 2*overlap3h[:, :, :, 12] + overlap3h[:, :, :, 14])
-    h5y = (overlap3h[:, :, :, 1] + 2*overlap3h[:, :, :, 6]
-            + 2*overlap3h[:, :, :, 8] + overlap3h[:, :, :, 15]
-            + 2*overlap3h[:, :, :, 17] + overlap3h[:, :, :, 19])
-    h5z = (overlap3h[:, :, :, 2] + 2*overlap3h[:, :, :, 7]
-            + 2*overlap3h[:, :, :, 9] + overlap3h[:, :, :, 16]
-            + 2*overlap3h[:, :, :, 18] + overlap3h[:, :, :, 20])
-    h5_dm = (
-        np.einsum('ijg,ij->g', h5x, dm, optimize=True) * normals[:, 0]
-        + np.einsum('ijg,ij->g', h5y, dm, optimize=True) * normals[:, 1]
-        + np.einsum('ijg,ij->g', h5z, dm, optimize=True) * normals[:, 2]
-    )
-    del overlap3h, h5x, h5y, h5z
-
-    d2Fhat_domega2_trace = 2.0 * f_contracted_dm / widths + h5_dm
-
-    d2F += np.einsum('g,Axg,g,Byg,g->ABxyg',
-                     wgrad_prefs, dareas, wgrad_prefs, dareas,
-                     d2Fhat_domega2_trace, optimize=True)
-
+    # ∂²F/∂ω² = (2/ω)·f_contracted + h5
+    d2Fhat_domega2 = 2.0 * first['fr2'] / widths + first['fr4']
+    d2F += _outer(wdA, wdA * d2Fhat_domega2)
     return d2F
