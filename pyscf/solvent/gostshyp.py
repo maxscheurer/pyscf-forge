@@ -187,6 +187,10 @@ class GOSTSHYP(lib.StreamObject):
         self.forces = None
         self.gtilde_expval = None
 
+        # Accumulated wall-clock time for kernel() and grad()
+        self._t_wall = 0.0
+        self._grad_t_wall = 0.0
+
         self.build()
 
     @property
@@ -371,13 +375,19 @@ class GOSTSHYP(lib.StreamObject):
         energy : float
         fock : ndarray of shape (nao, nao)
         """
+        import time as _time
+        _t0 = _time.perf_counter()
+
         if not (isinstance(dm, np.ndarray) and dm.ndim == 2):
             dm = dm[0] + dm[1]
 
         if self.direct:
-            return self._kernel_direct(dm)
+            result = self._kernel_direct(dm)
         else:
-            return self._kernel_cached(dm)
+            result = self._kernel_cached(dm)
+
+        self._t_wall += _time.perf_counter() - _t0
+        return result
 
     def _kernel_cached(self, dm):
         """Cached mode: uses precomputed gtilde and force_operators."""
@@ -520,6 +530,9 @@ class GOSTSHYP(lib.StreamObject):
         -------
         grad : ndarray of shape (natm, 3)
         """
+        import time as _time
+        _t0 = _time.perf_counter()
+
         if self.forces is None:
             raise RuntimeError(
                 'kernel() must be called before grad(). '
@@ -529,7 +542,9 @@ class GOSTSHYP(lib.StreamObject):
             dm = dm[0] + dm[1]
 
         from pyscf.solvent._gostshyp_hess import grad
-        return grad(self, dm)
+        result = grad(self, dm)
+        self._grad_t_wall = _time.perf_counter() - _t0
+        return result
 
     def hess_fd(self, dm, step=1e-4):
         """Semi-numerical Hessian via central finite differences of grad(dm).
@@ -792,6 +807,8 @@ class GOSTSHYP(lib.StreamObject):
         self.v = None
         self.amplitudes = None
         self.forces = None
+        self._t_wall = 0.0
+        self._grad_t_wall = 0.0
         self.build()
         return self
 
